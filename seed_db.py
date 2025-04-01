@@ -2,6 +2,7 @@ import json
 import psycopg2
 from psycopg2.extras import execute_batch
 from decimal import Decimal
+from datetime import datetime
 
 print("🚀 Starting seeding process...")
 
@@ -44,6 +45,7 @@ except Exception as e:
 # ✅ Step 3: Prepare records for batch insert
 records = []
 skipped = 0
+timestamp_now = datetime.utcnow()
 
 for item in tires:
     try:
@@ -57,7 +59,8 @@ for item in tires:
             Decimal(str(item["price"])) if item.get("price") is not None else None,
             item.get("stock"),
             int(item["inventory_count"]) if item.get("inventory_count") is not None else None,
-            item.get("picture")
+            item.get("picture"),
+            timestamp_now  # Add current timestamp
         ))
     except Exception as e:
         skipped += 1
@@ -70,8 +73,8 @@ try:
         INSERT INTO tires (
             seller, manufacturer, product_name,
             width, aspect_ratio, rim_size,
-            price, stock, inventory_count, picture
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            price, stock, inventory_count, picture, last_modified
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
     """, records)
     conn.commit()
     print(f"✅ Done! Inserted: {len(records)} | Skipped: {skipped}")
