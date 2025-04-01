@@ -1,3 +1,24 @@
+Eftir að hafa reynt í tvo daga að fá þetta til að keyra online --.. render .. railway
+
+gekk ekkert að fá online service til að keyra spider - safna í json , merga json , seeeda í database.
+
+en það virkar allt locally
+
+þannig að ég ætla bara að leyfa þessu að vera svona
+
+ef ég keyri þetta locally - skrapa ég frá dekkjasöluaðilum
+
+merga það allt í eitt json
+
+seeda það json í neon postgree gagangruninn minn.
+
+ætla svo að smíða framenda sem notar þann gagnagrunn
+
+þannig að þetta er bakendinn minn , en mér tókst ekki að fá hann til að keyra á netinu live (render,railway)
+
+prófaði allan andskotann .. python. dokcerfile.. keyra það i colab , en þá er ekki hægt að triggera það externally 
+
+örugglega auðvelt, en fann ekki út úr því.
 # Leita Vefskrapa Verkefni
 
 Þetta verkefni er vefskrapa sem safnar saman upplýsingum um dekk frá ýmsum seljendum á Íslandi. Markmiðið er að sameina gögnin á einn stað til að auðvelda samanburð og greiningu.

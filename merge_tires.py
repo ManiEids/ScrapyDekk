@@ -2,7 +2,7 @@ import json
 import re
 from pathlib import Path
 
-# Parse tire size
+# Lesa og greina dekkjastærð
 def parse_size(size_str):
     if not size_str:
         return None, None, None
@@ -16,14 +16,17 @@ def parse_size(size_str):
             return match.group(1), match.group(2), match.group(3)
     return None, None, None
 
-# Normalize price
+# Hreinsa og umreikna verð í heiltölur (krónur)
 def normalize_price(price_str):
     if not price_str:
         return None
-    price_clean = re.sub(r'[^\d]', '', price_str)
-    return float(price_clean) if price_clean else None
+    price_clean = re.sub(r'[^\d.,]', '', price_str).replace(',', '.')
+    try:
+        return int(float(price_clean))
+    except ValueError:
+        return None
 
-# Validate tire dimensions
+# Staðfesta lögmætar dekkjastærðir
 def is_valid_tire(width, aspect, rim):
     try:
         width = int(width)
@@ -37,7 +40,7 @@ def is_valid_tire(width, aspect, rim):
     except (TypeError, ValueError):
         return False
 
-# Extract Klettur details
+# Ná í framleiðanda og nafn hjá Klettur
 def extract_klettur_details(product_name):
     if not product_name:
         return None, product_name
@@ -51,7 +54,7 @@ def extract_klettur_details(product_name):
             return None, ' '.join(parts[1:]).strip()
     return None, product_name.strip()
 
-# Main function
+# Aðal keyrsla
 def main():
     sellers_files = {
         'Klettur': 'klettur.json',
@@ -97,7 +100,7 @@ def main():
                 price_total = normalize_price(item.get('price'))
                 inventory = item.get('inventory')
                 if inventory and inventory > 1:
-                    price = price_total / inventory
+                    price = int(price_total / inventory)
                     product_name += f" (sold as set of {inventory})"
                 else:
                     price = price_total
