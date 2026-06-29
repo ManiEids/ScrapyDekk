@@ -40,3 +40,12 @@ Thumbs.db
 *.mov
 *.mkv
 *.avi
+
+.env
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.json
+__pycache__/
+*.pyc
