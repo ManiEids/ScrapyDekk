@@ -2,7 +2,7 @@ import scrapy
 import json
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-# Extract attribute value
+# Ná í gildi eiginda
 def extract_attribute_value(attributes, slug):
     for attr in attributes:
         if attr.get("attribute", {}).get("slug") == slug:
@@ -11,7 +11,7 @@ def extract_attribute_value(attributes, slug):
                 return values[0].get("value")
     return None
 
-# Extract picture URL
+# Ná í slóð myndar
 def extract_picture(variants):
     for variant in variants:
         media_list = variant.get("media", [])
@@ -20,7 +20,7 @@ def extract_picture(variants):
             return image_info.get("productList") or image_info.get("productGallery")
     return None
 
-# Get first variant SKU
+# Ná í fyrsta SKU afbrigðis
 def get_first_variant_sku(product):
     variants = product.get("variants", [])
     if variants:
@@ -28,7 +28,7 @@ def get_first_variant_sku(product):
         return metadata.get("sku")
     return None
 
-# Check if in stock
+# Athuga hvort sé til á lager
 def is_in_stock(product):
     variants = product.get("variants", [])
     for variant in variants:
@@ -41,7 +41,6 @@ class N1FullCatalogueSpider(scrapy.Spider):
     name = "n1"
     allowed_domains = ["backend.n1.is"]
 
-    # Start requests
     def start_requests(self):
         payload = {
             "attributes": [],
@@ -65,7 +64,6 @@ class N1FullCatalogueSpider(scrapy.Spider):
             meta={"payload_body": body, "payload_headers": headers}
         )
 
-    # Parse response
     def parse(self, response):
         self.logger.info(f"Received response {response.status} from {response.url}")
         try:
@@ -141,7 +139,6 @@ class N1FullCatalogueSpider(scrapy.Spider):
         else:
             self.logger.info("No more results, stopping pagination.")
 
-    # Parse multiprice
     def parse_multiprice(self, response):
         try:
             price_data = response.json()

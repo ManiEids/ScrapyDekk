@@ -1,0 +1,67 @@
+# Scrapes the three tire sources, merges, and publishes combined_tire_data.json
+# as a rolling GitHub Release asset that the WordPress plugin pulls from.
+# No secrets required.
+
+name: Scrape tires & publish feed
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # every 6 hours at :17 UTC (avoids top-of-hour congestion)
+  workflow_dispatch: {}        # manual "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write              # required to create/update the Release asset
+
+concurrency:
+  group: tire-scrape           # never let two scrapes overlap
+  cancel-in-progress: false
+
+env:
+  WP_SITE: https://dekkjahusid.is
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run spiders
+        run: |
+          set -e
+          # -O overwrites output file (vs -o which appends and would corrupt JSON on rerun)
+          scrapy crawl klettur -O klettur.json  -s CONCURRENT_REQUESTS=8
+          scrapy crawl mitra   -O mitra.json    -s CONCURRENT_REQUESTS=8
+          scrapy crawl nesdekk -O nesdekk.json  -s CONCURRENT_REQUESTS=4 -s DOWNLOAD_DELAY=0.5
+
+      - name: Merge
+        run: python merge_tires.py
+
+      - name: Sanity check output
+        run: |
+          test -f combined_tire_data.json
+          COUNT=$(python -c "import json; print(len(json.load(open('combined_tire_data.json'))))")
+          echo "Merged $COUNT tires"
+          if [ "$COUNT" -lt 50 ]; then
+            echo "::error::Only $COUNT tires merged — refusing to publish."
+            exit 1
+          fi
+
+      - name: Publish feed as a rolling Release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: tire-feed
+          name: Tire feed (latest)
+          files: combined_tire_data.json
+
+      - name: Nudge WordPress to import now
+        run: |
+          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron" >/dev/null || true

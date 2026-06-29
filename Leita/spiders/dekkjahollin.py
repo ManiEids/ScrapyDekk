@@ -55,7 +55,7 @@ class DekkjahollinSpider(scrapy.Spider):
         'AUTOTHROTTLE_ENABLED': True,
     }
 
-    # Start requests
+    # Byrja á beiðnum
     def start_requests(self):
         base_url = "https://www.dekkjahollin.is/is/leit?q={size}&t%5B%5D=store"
         for rim, specs in self.rim_mapping.items():
@@ -70,7 +70,7 @@ class DekkjahollinSpider(scrapy.Spider):
                         meta={'tire_size': size, 'dont_redirect': True}
                     )
 
-    # Parse síðuna
+    # Vinna úr síðunni
     def parse(self, response):
         tire_size = response.meta.get("tire_size", "Unknown")
         self.logger.info(f"Parsing {response.url} for tire size: {tire_size}")

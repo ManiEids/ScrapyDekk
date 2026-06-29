@@ -18,7 +18,7 @@ class DekkjasalanSpider(scrapy.Spider):
         },
     }
     
-    # Parse síðuna
+    # Vinna úr síðunni
     def parse(self, response):
         body_snippet = response.text[:500]
         self.logger.info(f"DEKKJASALAN HTML snippet: {body_snippet}")

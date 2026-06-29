@@ -1,160 +1,247 @@
 import json
 import re
-from pathlib import Path
 
-# Lesa og greina dekkjastærð
-def parse_size(size_str):
-    if not size_str:
-        return None, None, None
-    patterns = [
-        r'(\d{3})[/-](\d{2})[/-R]?(\d{2})',
-        r'(\d{3})(\d{2})(\d{2})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, size_str)
-        if match:
-            return match.group(1), match.group(2), match.group(3)
-    return None, None, None
+# -----------------------------
+# Helpers
+# -----------------------------
 
-# Hreinsa og umreikna verð í heiltölur (krónur)
-def normalize_price(price_str):
-    if not price_str:
+def safe_int(val):
+    if val is None:
         return None
-    price_clean = re.sub(r'[^\d.,]', '', price_str).replace(',', '.')
     try:
-        return int(float(price_clean))
+        if isinstance(val, str):
+            val = val.replace(',', '.')
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def normalize_price(price_str):
+    """
+    Normalize ISK prices to integer.
+    Handles all formats encountered across the three sources:
+      "18.990 kr"   → 18990   (Klettur formatted)
+      "14900.00"    → 14900   (Mitra raw float string)
+      "27.995kr."   → 27995   (Nesdekk no space)
+      "16.990 kr."  → 16990   (Nesdekk with space)
+    """
+    if price_str is None:
+        return None
+    if isinstance(price_str, (int, float)):
+        return int(price_str)
+    price_str = str(price_str).strip()
+    # Remove currency label and whitespace
+    price_str = re.sub(r'[a-zA-Z\s]', '', price_str)
+    # Normalise decimal separator
+    price_str = price_str.replace(',', '.')
+    # Strip trailing ".00" (Mitra float strings)
+    if price_str.endswith('.00'):
+        price_str = price_str[:-3]
+    # Remove remaining dots (Icelandic thousands separators: "18.990" → "18990")
+    price_str = price_str.replace('.', '')
+    try:
+        return int(price_str) if price_str else None
     except ValueError:
         return None
 
-# Staðfesta lögmætar dekkjastærðir
-def is_valid_tire(width, aspect, rim):
-    try:
-        width = int(width)
-        aspect = int(aspect)
-        rim = int(rim)
-        return all([
-            100 <= width <= 400,
-            20 <= aspect <= 95,
-            10 <= rim <= 30
-        ])
-    except (TypeError, ValueError):
+
+def parse_size(size_str):
+    """
+    Parse passenger tire size string.
+    Input:  '205/55R16', '175-65-14', '205/55/16'
+    Output: (width_str, aspect_str, rim_str) or (None, None, None)
+    """
+    if not size_str:
+        return None, None, None
+    size_str = str(size_str).replace(',', '.')
+    # Skip fractional rim sizes (truck: 17.5, 19.5)
+    if re.search(r'R\d{2}[.,]\d', size_str):
+        return None, None, None
+    m = re.search(r'(\d{3})[-/](\d{2,3})[-/R]?(\d{2})', size_str)
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    return None, None, None
+
+
+def extract_manufacturer_from_name(name):
+    """
+    Fallback manufacturer extraction from Klettur product names.
+    E.g. "205/55R16 S Nexen N-Blue HD Plus Sumardekk 91H" → "Nexen"
+    """
+    if not name:
+        return None
+    size_match = re.search(r'\d{3}/\d{2,3}[A-Z]?\d{2}[A-Z]*\s+', name)
+    if not size_match:
+        return None
+    after_size = name[size_match.end():]
+    season_match = re.match(r'[A-Z]{1,2}\s+', after_size)
+    after_season = after_size[season_match.end():] if season_match else after_size
+    parts = after_season.split()
+    return parts[0] if parts else None
+
+
+def normalize_season(season):
+    """Standardize season values across sellers."""
+    if not season:
+        return ""
+    s = season.strip().lower()
+    if "sumar" in s:
+        return "Sumardekk"
+    if "vetra" in s or "vetrar" in s:
+        return "Vetrardekk"
+    if "heils" in s or "all season" in s or "allseason" in s:
+        return "Heilsársdekk"
+    return season  # return original if unrecognised
+
+
+def is_valid_tire(item):
+    """
+    Accept only real passenger car and light-SUV tires.
+    """
+    width  = item.get("width")
+    aspect = item.get("aspect_ratio")
+    rim    = item.get("rim_size")
+    price  = item.get("price")
+
+    if None in (width, aspect, rim):
+        return False
+    if not (125 <= width <= 355):
+        return False
+    if not (25 <= aspect <= 95):
+        return False
+    if not (12 <= rim <= 24):
+        return False
+    if price is None or price < 1000:
         return False
 
-# Ná í framleiðanda og nafn hjá Klettur
-def extract_klettur_details(product_name):
-    if not product_name:
-        return None, product_name
-    parts = product_name.split()
-    if len(parts) > 1 and re.match(r'\d{3}/\d{2}R\d{2}', parts[0]):
-        if len(parts) >= 3:
-            manufacturer = parts[2]
-            type_name = ' '.join(parts[3:]) if len(parts) > 3 else ""
-            return manufacturer, type_name.strip()
-        else:
-            return None, ' '.join(parts[1:]).strip()
-    return None, product_name.strip()
+    name = (item.get("product_name") or "").lower()
+    non_tire_keywords = [
+        'slanga', 'ventill', 'felga', 'felgur', 'viðgerð',
+        'repair', 'sealant', 'pumpa', 'verkfæri', 'hetta', 'bolti',
+    ]
+    if any(k in name for k in non_tire_keywords):
+        return False
 
-# Aðal keyrsla
+    return True
+
+
+# -----------------------------
+# Main merge logic
+# -----------------------------
+
 def main():
     sellers_files = {
-        'Klettur': 'klettur.json',
-        'Dekkjahollin': 'dekkjahollin.json',
-        'Dekkjasalan': 'dekkjasalan.json',
-        'Mitra': 'mitra.json',
-        'N1': 'n1.json',
-        'Nesdekk': 'nesdekk.json'
+        'Klettur':  'klettur.json',
+        'Mitra':    'mitra.json',
+        'Nesdekk':  'nesdekk.json',
     }
 
-    combined_tires = []
+    combined = []
 
     for seller, filename in sellers_files.items():
-        with open(filename, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print(f"⚠️  {filename} not found, skipping.")
+            continue
+        except json.JSONDecodeError as e:
+            print(f"⚠️  {filename} is invalid JSON: {e}")
+            continue
+
+        print(f"📂 {seller}: {len(data)} raw items")
+        seller_ok = 0
 
         for item in data:
-            width, aspect, rim = None, None, None
+            inventory = None  # default
 
+            # ── KLETTUR ──────────────────────────────────────────────────
             if seller == 'Klettur':
-                width, aspect, rim = item.get('Width'), item.get('Height'), item.get('RimSize')
-                if width == 0 or aspect == 0 or rim == 0:
-                    continue
-                product_name = item.get('ItemName')
-                price = item.get('Price')
-                stock = 'in stock' if item.get('QTY', 0) > 0 else 'out of stock'
-                inventory = item.get('QTY')
-                picture = item.get('photourl')
-                manufacturer, product_name = extract_klettur_details(product_name)
-
-            elif seller == 'Dekkjahollin':
-                width, aspect, rim = parse_size(item.get('tire_size'))
-                product_name = item.get('title')
-                price = normalize_price(item.get('price'))
-                stock = 'in stock' if 'til í' in item.get('stock', '').lower() else 'out of stock'
-                inventory = None
-                picture = item.get('picture')
-                manufacturer = item.get('manufacturer')
-
-            elif seller == 'Dekkjasalan':
-                width, aspect, rim = parse_size(item.get('tire_size'))
-                product_name = item.get('title')
-                price_total = normalize_price(item.get('price'))
-                inventory = item.get('inventory')
-                if inventory and inventory > 1:
-                    price = int(price_total / inventory)
-                    product_name += f" (sold as set of {inventory})"
-                else:
-                    price = price_total
-                stock = item.get('stock')
-                picture = item.get('picture')
-                manufacturer = item.get('manufacturer')
-
-            elif seller == 'Mitra':
-                width, aspect, rim = item.get('width'), item.get('profile'), item.get('rim')
-                product_name = item.get('title')
-                price = normalize_price(item.get('price'))
-                stock = item.get('stock')
-                inventory = item.get('inventory')
-                picture = item.get('picture')
-                manufacturer = item.get('manufacturer')
-
-            elif seller == 'N1':
-                width, aspect, rim = parse_size(item.get('size'))
+                width        = item.get('width')
+                aspect       = item.get('profile')
+                rim          = item.get('rim')
                 product_name = item.get('name')
-                price = normalize_price(item.get('price'))
-                stock = item.get('stock')
-                inventory = None
-                picture = item.get('picture')
-                manufacturer = item.get('manufacturer')
+                manufacturer = item.get('manufacturer') or extract_manufacturer_from_name(item.get('name'))
+                sku          = item.get('sku')
+                season       = normalize_season(item.get('season', ''))
+                price        = normalize_price(item.get('price'))
+                inventory    = item.get('qty')
+                stock        = item.get('stock', 'unknown')
+                picture      = item.get('picture') or ''
 
+            # ── MITRA ────────────────────────────────────────────────────
+            elif seller == 'Mitra':
+                width        = item.get('width')
+                aspect       = item.get('profile')
+                rim          = item.get('rim')
+                product_name = item.get('title')
+                manufacturer = item.get('manufacturer')
+                sku          = item.get('sku')
+                season       = normalize_season(item.get('season', ''))
+                price        = normalize_price(item.get('price'))
+                inventory    = item.get('inventory')
+                stock        = item.get('stock', 'unknown')
+                picture      = item.get('picture') or ''
+
+            # ── NESDEKK ──────────────────────────────────────────────────
+            # Spider now yields: product_id, sku, name, manufacturer,
+            #   season, tyre_size, price, picture, stock, inventory,
+            #   stock_text, source
             elif seller == 'Nesdekk':
                 width, aspect, rim = parse_size(item.get('tyre_size'))
                 product_name = item.get('name')
-                price = normalize_price(item.get('price'))
-                stock_text = item.get('stock', '').lower()
-                stock = 'in stock' if 'á lager' in stock_text else 'out of stock'
-                inventory = None
-                picture = item.get('picture')
                 manufacturer = item.get('manufacturer')
+                sku          = item.get('sku')
+                season       = normalize_season(item.get('season', ''))
+                price        = normalize_price(item.get('price'))
+                inventory    = item.get('inventory')
+                raw_stock    = (item.get('stock') or '').lower()
+                stock        = 'out of stock' if 'out' in raw_stock else 'in stock'
+                picture      = item.get('picture') or ''
 
-            if is_valid_tire(width, aspect, rim):
-                combined_tires.append({
-                    "seller": seller,
-                    "manufacturer": manufacturer,
-                    "product_name": product_name,
-                    "width": width,
-                    "aspect_ratio": aspect,
-                    "rim_size": rim,
-                    "size": item.get('size') or item.get('tire_size') or item.get('tyre_size'),
-                    "price": price,
-                    "stock": stock,
-                    "inventory_count": inventory,
-                    "picture": picture
-                })
+            else:
+                continue
+
+            tire = {
+                "seller":          seller,
+                "sku":             sku,
+                "manufacturer":    manufacturer,
+                "product_name":    product_name,
+                "width":           safe_int(width),
+                "aspect_ratio":    safe_int(aspect),
+                "rim_size":        safe_int(rim),
+                "season":          season,
+                "price":           price,
+                "stock":           stock,
+                "inventory_count": safe_int(inventory) if inventory is not None else None,
+                "picture":         picture,
+                "source":          item.get('source', seller.lower() + '.is'),
+            }
+
+            combined.append(tire)
+            if is_valid_tire(tire):
+                seller_ok += 1
+
+        print(f"   ✅ {seller_ok} valid  |  ❌ {len(data) - seller_ok} filtered")
+
+    filtered = [t for t in combined if is_valid_tire(t)]
+
+    # Stats: season breakdown for the WordPress filter
+    season_counts = {}
+    for t in filtered:
+        season_counts[t["season"] or "(none)"] = season_counts.get(t["season"] or "(none)", 0) + 1
 
     with open('combined_tire_data.json', 'w', encoding='utf-8') as out:
-        json.dump(combined_tires, out, ensure_ascii=False, indent=2)
+        json.dump(filtered, out, ensure_ascii=False, indent=2)
 
-    print("✅ Successfully combined all tire data into combined_tire_data.json")
+    print(f"\n✅ Total kept:    {len(filtered)}")
+    print(f"❌ Total dropped: {len(combined) - len(filtered)}")
+    print(f"📄 Written to:    combined_tire_data.json")
+    print(f"\nSeason breakdown:")
+    for s, n in sorted(season_counts.items(), key=lambda x: -x[1]):
+        print(f"   {s:18} {n}")
+
 
 if __name__ == "__main__":
+    print("🚀 Running tire merge...")
     main()
