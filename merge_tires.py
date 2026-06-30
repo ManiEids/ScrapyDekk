@@ -211,6 +211,18 @@ def normalize_manufacturer(name):
     return _MFR_NORM.get(lower, name)
 
 
+# Manufacturers whose tires are excluded from the public feed to reduce bloat.
+# Matched against the NORMALISED manufacturer value (case-insensitive).
+_BLOCKED_MANUFACTURERS = {
+    "Michelin",
+    "Sonix",
+    "Westlake",
+    "Double Coin",
+    "Headway",
+    "Gt Radial",
+}
+
+
 _NON_TIRE_KEYWORDS = [
     # Accessories / tools
     'slanga', 'ventill', 'felga', 'felgur', 'viðgerð',
@@ -245,6 +257,15 @@ def is_valid_tire(item):
 
     name = (item.get("product_name") or "").lower()
     if any(k in name for k in _NON_TIRE_KEYWORDS):
+        return False
+
+    mfr = (item.get("manufacturer") or "").lower()
+    if mfr in _BLOCKED_MANUFACTURERS:
+        return False
+
+    # Klettur stores the truck-tire category as season="Vörubíladekk" in their API.
+    # The product name doesn't contain the word, so the keyword check above misses it.
+    if "vörubíladekk" in (item.get("season") or "").lower():
         return False
 
     # Flotation/off-road (jeep) tires bypass metric dimension checks
@@ -286,6 +307,13 @@ def drop_reason(item):
     for k in _NON_TIRE_KEYWORDS:
         if k in name:
             return f"keyword: {k}"
+
+    mfr = (item.get("manufacturer") or "").lower()
+    if mfr in _BLOCKED_MANUFACTURERS:
+        return f"blocked manufacturer: {item.get('manufacturer')}"
+
+    if "vörubíladekk" in (item.get("season") or "").lower():
+        return "season field is Vörubíladekk (truck tire from Klettur API)"
 
     if is_jeep_tire(item):
         return "valid jeep tire"  # should not appear in dropped
@@ -431,24 +459,26 @@ def main():
                 "source":          item.get('source', seller.lower() + '.is'),
             }
 
-            # Flotation/off-road tires: tag, override season, and extract proper dimensions
+            # Flotation/off-road tires: tag, override season, and map to standard fields.
+            # width = section width in inches (e.g. 12), aspect_ratio = outer diameter in
+            # inches (e.g. 33), so the WordPress card renders "33x12.50R18" correctly.
             if is_jeep_tire(tire):
                 tire["season"]    = "Jeppadekk"
                 tire["size_type"] = "flotation"
                 fm = _FLOTATION_PARSE_RE.search(tire.get("product_name") or "")
                 if fm:
                     frac = fm.group(3)
-                    tire["flotation_diameter"] = int(fm.group(1))
-                    tire["flotation_width"]    = round(int(fm.group(2)) + (int(frac) / 100.0 if frac else 0), 2)
-                    tire["rim_size"]           = int(fm.group(4))
+                    tire["aspect_ratio"] = int(fm.group(1))                                          # outer diameter
+                    tire["width"]        = round(int(fm.group(2)) + (int(frac) / 100.0 if frac else 0), 2)  # section width
+                    tire["rim_size"]     = int(fm.group(4))
                 elif seller == "Mitra":
-                    # Mitra: width field = section-width inches, aspect field = outer-diameter inches
-                    tire["flotation_diameter"] = tire.get("aspect_ratio")
-                    tire["flotation_width"]    = tire.get("width")
-                    # rim_size is already correct from the Mitra block
-                # Clear metric fields — they are meaningless / inconsistent for flotation tires
-                tire["width"]        = None
-                tire["aspect_ratio"] = None
+                    # Mitra API: width_field = section-width inches, profile_field = outer-diameter
+                    # These are already stored correctly in tire["width"] / tire["aspect_ratio"]
+                    pass
+                else:
+                    # No parseable size and not Mitra — clear inconsistent metric values
+                    tire["width"]        = None
+                    tire["aspect_ratio"] = None
             else:
                 tire["size_type"] = "metric"
 

@@ -49,10 +49,27 @@ class N1FullCatalogueSpider(scrapy.Spider):
 
     # Map substrings of product.category.slug → season label.
     SLUG_SEASON_MAP = {
-        "sumardekk":  "Sumardekk",
-        "vetrardekk": "Vetrardekk",
+        "sumardekk":   "Sumardekk",
+        "vetrardekk":  "Vetrardekk",
         "heilsarsdekk": "Heilsársdekk",
     }
+
+    # Sub-strings of category slug that identify non-passenger-tire products.
+    # Checked before the multiprice request so we skip both the request and the item.
+    # N1 slugs are ASCII/unaccented, so "motor" matches "motordekk", etc.
+    SKIP_SLUG_FRAGMENTS = frozenset({
+        "motor",      # motorcycle tires
+        "reidhjol",   # bicycle tires
+        "fjorhjol",   # ATV / quad
+        "atv",
+        "vinnuvela",  # machinery tires
+        "slaettuvela", # lawnmower tires
+        "grasdekk",   # turf / lawn tires
+        "felg",       # rims / wheels (felgur)
+        "voru",       # vörubíladekk (truck tires) — "voru" prefix in slug
+        "slanga",     # inner tubes
+        "ventill",    # valves / accessories
+    })
 
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -114,9 +131,14 @@ class N1FullCatalogueSpider(scrapy.Spider):
             variants = product.get("variants", [])
             picture = extract_picture(variants)
 
-            # Try to extract season from the product's own category slug
-            season = ""
+            # Resolve category slug and skip non-passenger categories immediately —
+            # before the multiprice request — so we pay for those API calls only
+            # for items we'll actually keep.
             cat_slug = (product.get("category") or {}).get("slug", "").lower()
+            if any(frag in cat_slug for frag in self.SKIP_SLUG_FRAGMENTS):
+                continue
+
+            season = ""
             for key, label in self.SLUG_SEASON_MAP.items():
                 if key in cat_slug:
                     season = label
