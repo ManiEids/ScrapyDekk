@@ -1,20 +1,23 @@
 # .github/workflows/scrape.yml
-# Scrapes all tire sources from your self-hosted Proxmox runner,
-# merges them into combined_tire_data.json,
-# publishes the JSON as a rolling GitHub Release asset,
-# and nudges WordPress to import the newest feed.
+# Scrapes all 4 sources IN PARALLEL on a GitHub-hosted runner, merges, and publishes
+# combined_tire_data.json as a rolling Release asset that WordPress pulls from.
 
 name: Scrape tires & publish feed
 
 on:
   schedule:
-    # Once per day at 03:17 Iceland time / UTC
-    - cron: '17 3 * * *'
-
-  workflow_dispatch: {}
+    - cron: '17 */6 * * *'       # every 6h at :17 UTC (GitHub may delay a few min)
+  workflow_dispatch: {}            # manual "Run workflow" button (use this to test)
+  push:                            # publish immediately when scraper code changes
+    branches: [ main ]
+    paths:
+      - 'Leita/**'
+      - 'merge_tires.py'
+      - 'requirements.txt'
+      - '.github/workflows/scrape.yml'
 
 permissions:
-  contents: write
+  contents: write                  # required to update the Release asset
 
 concurrency:
   group: tire-scrape
@@ -25,51 +28,55 @@ env:
 
 jobs:
   scrape:
-    runs-on: [self-hosted, linux]
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
         run: |
           set -e
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scrapers
+      - name: Run all 4 spiders IN PARALLEL
         run: |
-          set -e
-          . .venv/bin/activate
+          # Background each spider (like run_all.py's Pool). Per-domain politeness is
+          # set INSIDE each spider's custom_settings, so no -s flags needed here.
+          # No 'set -e': one spider failing must NOT abort the others.
+          scrapy crawl klettur -O klettur.json &
+          scrapy crawl mitra   -O mitra.json   &
+          scrapy crawl nesdekk -O nesdekk.json &
+          scrapy crawl n1      -O n1.json       &
+          wait
+          echo "All spiders finished. Raw line counts:"
+          wc -l klettur.json mitra.json nesdekk.json n1.json 2>/dev/null || true
 
-          scrapy crawl klettur -O klettur.json -s CONCURRENT_REQUESTS=16 -s CONCURRENT_REQUESTS_PER_DOMAIN=16
-          scrapy crawl mitra   -O mitra.json   -s CONCURRENT_REQUESTS=8
-          scrapy crawl nesdekk -O nesdekk.json -s CONCURRENT_REQUESTS=4 -s DOWNLOAD_DELAY=0.5
-          scrapy crawl n1      -O n1.json      -s CONCURRENT_REQUESTS=8
+      - name: Merge
+        run: python merge_tires.py
 
-      - name: Merge tire data
+      - name: Don't publish a broken scrape
         run: |
-          set -e
-          . .venv/bin/activate
-          python merge_tires.py
-
-      - name: Count merged tires
-        run: |
-          set -e
-          . .venv/bin/activate
+          # Only guard against a TOTAL failure (empty / invalid / missing file).
+          # No size threshold here on purpose: WordPress already rejects any feed
+          # below half the current catalogue and keeps a restorable backup.
+          # `python -c` exits non-zero if the file is missing or not valid JSON.
           COUNT=$(python -c "import json; print(len(json.load(open('combined_tire_data.json'))))")
           echo "Merged $COUNT tires"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::0 tires merged -- refusing to publish an empty feed."
+            exit 1
+          fi
 
-      - name: Publish feed as rolling Release asset
-        uses: softprops/action-gh-release@v2.6.2
+      - name: Publish feed as a rolling Release asset
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: tire-feed
-          name: Tire feed latest
+          name: Tire feed (latest)
           files: combined_tire_data.json
-          fail_on_unmatched_files: true
 
-      - name: Nudge WordPress import
-        run: |
-          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
+      - name: Nudge WordPress to import now
+        run: curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true

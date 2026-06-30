@@ -140,6 +140,10 @@ _FLOTATION_NAME_RE = re.compile(r'\b\d{2}x\d{2}[,.]?\d*R\d{2}[A-Z]*\b', re.IGNOR
 # "37x12,50R20LT" → groups (37, 12, 50, 20)  diameter, width_int, width_frac, rim
 _FLOTATION_PARSE_RE = re.compile(r'\b(\d{2})x(\d{2})[,.]?(\d*)R(\d{2})', re.IGNORECASE)
 
+# N1 stores flotation tires in reversed order: "{rim} R {diameter}x{section} {Brand}..."
+# E.g. "17 R 37x13.50 BFGoodrich Mud Terrain T/A KM3" → rim=17, dia=37, sec=13.5
+_N1_FLOTATION_NAME_RE = re.compile(r'(\d{2})\s+R\s+(\d{2})x(\d{2})[.,]?(\d*)\s', re.IGNORECASE)
+
 # Hyphen-separated sizes without R ("180/70-15", "400/50-15") indicate motorcycle/
 # agricultural/turf tires — not radial passenger/jeep tires.
 _NON_RADIAL_SIZE_IN_NAME_RE = re.compile(r'\d{3}/\d{2,3}-\d{2}', re.IGNORECASE)
@@ -211,15 +215,10 @@ def normalize_manufacturer(name):
     return _MFR_NORM.get(lower, name)
 
 
-# Manufacturers whose tires are excluded from the public feed to reduce bloat.
-# Matched against the NORMALISED manufacturer value (case-insensitive).
+
 _BLOCKED_MANUFACTURERS = {
-    "Michelin",
-    "Sonix",
-    "Westlake",
-    "Double Coin",
-    "Headway",
-    "Gt Radial",
+    "",
+
 }
 
 
@@ -268,9 +267,10 @@ def is_valid_tire(item):
     if "vörubíladekk" in (item.get("season") or "").lower():
         return False
 
-    # Flotation/off-road (jeep) tires bypass metric dimension checks
+    # Flotation/off-road (jeep) tires bypass metric dimension checks,
+    # but only if the inch size actually parsed (else the card renders "NonexNone").
     if is_jeep_tire(item):
-        return True
+        return item.get("width") is not None and item.get("aspect_ratio") is not None
 
     # Truck/commercial rims appear as R22,5 / R17,5 / R19,5 in the product name.
     # Klettur stores rim as an integer so structured rim_size field alone can't catch them.
@@ -410,7 +410,15 @@ def main():
             #   season, tyre_size, price, picture, stock, inventory,
             #   stock_text, source
             elif seller == 'Nesdekk':
-                width, aspect, rim = parse_size(item.get('tyre_size'))
+                tyre_size_str = item.get('tyre_size')
+                width, aspect, rim = parse_size(tyre_size_str)
+                if width is None:
+                    fm_flt = _FLOTATION_PARSE_RE.search(str(tyre_size_str or ''))
+                    if fm_flt:
+                        frac   = fm_flt.group(3)
+                        aspect = int(fm_flt.group(1))
+                        width  = round(int(fm_flt.group(2)) + (int(frac) / (10 ** len(frac)) if frac else 0), 2)
+                        rim    = int(fm_flt.group(4))
                 product_name = item.get('name')
                 manufacturer = item.get('manufacturer')
                 sku          = item.get('sku')
@@ -433,6 +441,13 @@ def main():
                     continue
                 width, aspect, rim = parse_size(item.get('size'))
                 product_name = item.get('name')
+                if width is None:
+                    fm_flt = _N1_FLOTATION_NAME_RE.search(product_name or '')
+                    if fm_flt:
+                        frac   = fm_flt.group(4)
+                        rim    = int(fm_flt.group(1))
+                        aspect = int(fm_flt.group(2))
+                        width  = round(int(fm_flt.group(3)) + (int(frac) / (10 ** len(frac)) if frac else 0), 2)
                 manufacturer = item.get('manufacturer') or extract_manufacturer_from_n1_name(product_name)
                 sku          = None
                 season       = normalize_season(item.get('season', ''))
@@ -468,15 +483,17 @@ def main():
                 fm = _FLOTATION_PARSE_RE.search(tire.get("product_name") or "")
                 if fm:
                     frac = fm.group(3)
-                    tire["aspect_ratio"] = int(fm.group(1))                                          # outer diameter
-                    tire["width"]        = round(int(fm.group(2)) + (int(frac) / 100.0 if frac else 0), 2)  # section width
+                    tire["aspect_ratio"] = int(fm.group(1))
+                    tire["width"]        = round(int(fm.group(2)) + (int(frac) / (10 ** len(frac)) if frac else 0), 2)
                     tire["rim_size"]     = int(fm.group(4))
-                elif seller == "Mitra":
-                    # Mitra API: width_field = section-width inches, profile_field = outer-diameter
-                    # These are already stored correctly in tire["width"] / tire["aspect_ratio"]
-                    pass
+                elif seller in ("Mitra", "Nesdekk", "N1"):
+                    # width/aspect/rim were set correctly in the seller block
+                    # (section_width_inches / outer_diameter_inches / rim_inches).
+                    # Restore float precision — safe_int() truncated them.
+                    tire["width"]        = width
+                    tire["aspect_ratio"] = aspect
+                    tire["rim_size"]     = rim
                 else:
-                    # No parseable size and not Mitra — clear inconsistent metric values
                     tire["width"]        = None
                     tire["aspect_ratio"] = None
             else:
