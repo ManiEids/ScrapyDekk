@@ -172,4 +172,21 @@ jobs:
 
       - name: Trigger WordPress feed import
         run: |
-          curl -fsS --max-time 90 -X POST "$WP_SITE/wp-json/dts/v1/sync?key=${{ secrets.DTS_SYNC_SECRET }}"
+          set -e
+
+          HTTP_CODE=$(curl -sS --max-time 120 \
+            -X POST \
+            -H "X-DTS-Sync-Secret: ${{ secrets.DTS_SYNC_SECRET }}" \
+            -o dts-sync-response.json \
+            -w "%{http_code}" \
+            "$WP_SITE/wp-json/dts/v1/sync")
+
+          echo "WordPress sync HTTP status: $HTTP_CODE"
+          echo "WordPress sync response:"
+          cat dts-sync-response.json
+          echo ""
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::WordPress sync failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
