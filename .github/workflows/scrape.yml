@@ -1,14 +1,12 @@
 # .github/workflows/scrape.yml
-# Scrapes all 4 sources IN PARALLEL on a GitHub-hosted runner, merges, and publishes
-# combined_tire_data.json as a rolling Release asset that WordPress pulls from.
 
 name: Scrape tires & publish feed
 
 on:
   schedule:
-    - cron: '17 */6 * * *'       # every 6h at :17 UTC (GitHub may delay a few min)
-  workflow_dispatch: {}            # manual "Run workflow" button (use this to test)
-  push:                            # publish immediately when scraper code changes
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+  push:
     branches: [ main ]
     paths:
       - 'Leita/**'
@@ -17,7 +15,7 @@ on:
       - '.github/workflows/scrape.yml'
 
 permissions:
-  contents: write                  # required to update the Release asset
+  contents: write
 
 concurrency:
   group: tire-scrape
@@ -29,6 +27,7 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -42,41 +41,67 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run all 4 spiders IN PARALLEL
+      - name: Run Klettur
         run: |
-          # Background each spider (like run_all.py's Pool). Per-domain politeness is
-          # set INSIDE each spider's custom_settings, so no -s flags needed here.
-          # No 'set -e': one spider failing must NOT abort the others.
-          scrapy crawl klettur -O klettur.json &
-          scrapy crawl mitra   -O mitra.json   &
-          scrapy crawl nesdekk -O nesdekk.json &
-          scrapy crawl n1      -O n1.json       &
-          wait
-          echo "All spiders finished. Raw line counts:"
-          wc -l klettur.json mitra.json nesdekk.json n1.json 2>/dev/null || true
+          set -e
+          scrapy crawl klettur -O klettur.json
+          python -c "import json; d=json.load(open('klettur.json')); print('Klettur raw:', len(d)); assert len(d) > 0"
+
+      - name: Run Mitra
+        run: |
+          set -e
+          scrapy crawl mitra -O mitra.json
+          python -c "import json; d=json.load(open('mitra.json')); print('Mitra raw:', len(d)); assert len(d) > 0"
+
+      - name: Run Nesdekk
+        run: |
+          set -e
+          scrapy crawl nesdekk -O nesdekk.json
+          python -c "import json; d=json.load(open('nesdekk.json')); print('Nesdekk raw:', len(d)); assert len(d) > 0"
+
+      - name: Run N1
+        run: |
+          set -e
+          scrapy crawl n1 -O n1.json
+          python -c "import json; d=json.load(open('n1.json')); print('N1 raw:', len(d)); assert len(d) > 0"
 
       - name: Merge
-        run: python merge_tires.py
-
-      - name: Don't publish a broken scrape
         run: |
-          # Only guard against a TOTAL failure (empty / invalid / missing file).
-          # No size threshold here on purpose: WordPress already rejects any feed
-          # below half the current catalogue and keeps a restorable backup.
-          # `python -c` exits non-zero if the file is missing or not valid JSON.
-          COUNT=$(python -c "import json; print(len(json.load(open('combined_tire_data.json'))))")
-          echo "Merged $COUNT tires"
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::error::0 tires merged -- refusing to publish an empty feed."
-            exit 1
-          fi
+          set -e
+          python merge_tires.py
 
-      - name: Publish feed as a rolling Release asset
-        uses: softprops/action-gh-release@v2
+      - name: Validate merged feed by seller
+        run: |
+          set -e
+          python - <<'PY'
+          import json
+          from collections import Counter
+
+          d = json.load(open("combined_tire_data.json", encoding="utf-8"))
+          counts = Counter(x.get("seller") for x in d)
+
+          print("Merged total:", len(d))
+          for seller in ["Klettur", "Mitra", "Nesdekk", "N1"]:
+              print(f"{seller}: {counts.get(seller, 0)}")
+
+          required = ["Klettur", "Mitra", "Nesdekk", "N1"]
+          missing = [s for s in required if counts.get(s, 0) == 0]
+
+          if missing:
+              raise SystemExit(f"Refusing to publish. Missing sellers: {', '.join(missing)}")
+
+          if len(d) < 4000:
+              raise SystemExit(f"Refusing to publish suspiciously small feed: {len(d)} rows")
+          PY
+
+      - name: Publish feed as rolling Release asset
+        uses: softprops/action-gh-release@v2.6.2
         with:
           tag_name: tire-feed
-          name: Tire feed (latest)
+          name: Tire feed latest
           files: combined_tire_data.json
+          fail_on_unmatched_files: true
 
-      - name: Nudge WordPress to import now
-        run: curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
+      - name: Nudge WordPress import
+        run: |
+          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
