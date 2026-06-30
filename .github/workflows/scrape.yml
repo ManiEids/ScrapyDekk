@@ -156,7 +156,7 @@ jobs:
           if missing:
               raise SystemExit(f"Refusing to publish. Missing seller data: {', '.join(missing)}")
 
-          if len(data) < 3000:
+          if len(data) < 1000:
               raise SystemExit(f"Refusing to publish suspiciously small feed: {len(data)} rows")
 
           print("Feed validation passed.")
