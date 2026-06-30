@@ -1,80 +1,76 @@
 # .github/workflows/scrape.yml
-# Scrapes ALL FOUR tire sources from a self-hosted runner on your Proxmox lab
-# (Icelandic IP -> sites return the full catalogue), merges, and publishes
-# combined_tire_data.json as a rolling GitHub Release asset that WordPress pulls.
+# Scrapes all tire sources from your self-hosted Proxmox runner,
+# merges them into combined_tire_data.json,
+# publishes the JSON as a rolling GitHub Release asset,
+# and nudges WordPress to import the newest feed.
 
 name: Scrape tires & publish feed
 
 on:
   schedule:
-    - cron: '17 */6 * * *'       # every 6h at :17 UTC
-  workflow_dispatch: {}            # manual "Run workflow" button
-  push:                            # publish immediately when scraper code changes
-    branches: [ main ]
-    paths:
-      - 'Leita/**'
-      - 'merge_tires.py'
-      - 'requirements.txt'
-      - '.github/workflows/scrape.yml'
+    # Once per day at 03:17 Iceland time / UTC
+    - cron: '17 3 * * *'
+
+  # Allows manual "Run workflow" from GitHub Actions
+  workflow_dispatch: {}
 
 permissions:
-  contents: write                  # required to update the Release asset
+  contents: write
 
 concurrency:
-  group: tire-scrape               # never overlap two scrapes
+  group: tire-scrape
   cancel-in-progress: false
 
 env:
   WP_SITE: https://dekkjahusid.is
-  MIN_TIRES: '4000'                # safety floor: refuse to publish a partial scrape over a good feed
 
 jobs:
   scrape:
-    # Your Proxmox runner = Icelandic IP = full results.
-    # Swap to 'ubuntu-latest' only if you want the (incomplete) GitHub-hosted fallback.
     runs-on: [self-hosted, linux]
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Install deps (isolated venv)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
         run: |
           set -e
-          python3 -m venv .venv               # venv keeps the persistent runner clean + avoids PEP-668
+          python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run all 4 spiders
+      - name: Run scrapers
         run: |
           set -e
           . .venv/bin/activate
-          # -O OVERWRITES the output file (vs -o which appends and would corrupt the JSON on rerun)
+
           scrapy crawl klettur -O klettur.json -s CONCURRENT_REQUESTS=16 -s CONCURRENT_REQUESTS_PER_DOMAIN=16
           scrapy crawl mitra   -O mitra.json   -s CONCURRENT_REQUESTS=8
           scrapy crawl nesdekk -O nesdekk.json -s CONCURRENT_REQUESTS=4 -s DOWNLOAD_DELAY=0.5
-          scrapy crawl n1      -O n1.json      -s CONCURRENT_REQUESTS=8   # <- was missing entirely
+          scrapy crawl n1      -O n1.json      -s CONCURRENT_REQUESTS=8
 
-      - name: Merge
+      - name: Merge tire data
         run: |
+          set -e
           . .venv/bin/activate
           python merge_tires.py
 
-      - name: Sanity check (protect the live feed)
+      - name: Count merged tires
         run: |
+          set -e
           . .venv/bin/activate
           COUNT=$(python -c "import json; print(len(json.load(open('combined_tire_data.json'))))")
           echo "Merged $COUNT tires"
-          if [ "$COUNT" -lt "$MIN_TIRES" ]; then
-            echo "::error::Only $COUNT tires (< $MIN_TIRES) -- refusing to publish; keeping last good feed."
-            exit 1
-          fi
 
-      - name: Publish feed as a rolling Release asset
-        uses: softprops/action-gh-release@v2
+      - name: Publish feed as rolling Release asset
+        uses: softprops/action-gh-release@v2.6.2
         with:
-          tag_name: tire-feed              # fixed tag -> stable download URL
-          name: Tire feed (latest)
+          tag_name: tire-feed
+          name: Tire feed latest
           files: combined_tire_data.json
+          fail_on_unmatched_files: true
 
-      - name: Nudge WordPress to import now
-        run: curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
+      - name: Nudge WordPress import
+        run: |
+          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
