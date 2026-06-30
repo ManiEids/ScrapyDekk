@@ -1,7 +1,7 @@
 # .github/workflows/scrape.yml
-# Scrapes tire sources slowly and safely, merges them into combined_tire_data.json,
+# Scrapes tire sources, merges them into combined_tire_data.json,
 # publishes the JSON as a rolling GitHub Release asset,
-# and nudges WordPress to import the newest feed.
+# and directly triggers WordPress to import the newest feed.
 
 name: Scrape tires & publish feed
 
@@ -49,44 +49,79 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Klettur slowly
+      - name: Run tire spiders in parallel
         run: |
           set -e
+
           scrapy crawl klettur -O klettur.json \
-            -s CONCURRENT_REQUESTS=2 \
-            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
-            -s DOWNLOAD_DELAY=1.5 \
+            -s CONCURRENT_REQUESTS=8 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=4 \
+            -s DOWNLOAD_DELAY=0.1 \
             -s AUTOTHROTTLE_ENABLED=True \
-            -s AUTOTHROTTLE_START_DELAY=1 \
-            -s AUTOTHROTTLE_MAX_DELAY=8 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
-          python -c "import json; d=json.load(open('klettur.json', encoding='utf-8')); print('Klettur raw:', len(d)); assert len(d) > 0"
+            -s AUTOTHROTTLE_START_DELAY=0.2 \
+            -s AUTOTHROTTLE_MAX_DELAY=4 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 \
+            > klettur.log 2>&1 &
+          PID_KLETTUR=$!
 
-      - name: Run Mitra slowly
-        run: |
-          set -e
           scrapy crawl mitra -O mitra.json \
-            -s CONCURRENT_REQUESTS=2 \
-            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
-            -s DOWNLOAD_DELAY=1 \
+            -s CONCURRENT_REQUESTS=8 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=4 \
+            -s DOWNLOAD_DELAY=0.1 \
             -s AUTOTHROTTLE_ENABLED=True \
-            -s AUTOTHROTTLE_START_DELAY=1 \
-            -s AUTOTHROTTLE_MAX_DELAY=8 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
-          python -c "import json; d=json.load(open('mitra.json', encoding='utf-8')); print('Mitra raw:', len(d)); assert len(d) > 0"
+            -s AUTOTHROTTLE_START_DELAY=0.2 \
+            -s AUTOTHROTTLE_MAX_DELAY=4 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 \
+            > mitra.log 2>&1 &
+          PID_MITRA=$!
 
-      - name: Run Nesdekk slowly
-        run: |
-          set -e
           scrapy crawl nesdekk -O nesdekk.json \
-            -s CONCURRENT_REQUESTS=1 \
-            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
-            -s DOWNLOAD_DELAY=2 \
+            -s CONCURRENT_REQUESTS=4 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=2 \
+            -s DOWNLOAD_DELAY=0.25 \
             -s AUTOTHROTTLE_ENABLED=True \
-            -s AUTOTHROTTLE_START_DELAY=1 \
-            -s AUTOTHROTTLE_MAX_DELAY=10 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
-          python -c "import json; d=json.load(open('nesdekk.json', encoding='utf-8')); print('Nesdekk raw:', len(d)); assert len(d) > 0"
+            -s AUTOTHROTTLE_START_DELAY=0.5 \
+            -s AUTOTHROTTLE_MAX_DELAY=6 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.5 \
+            > nesdekk.log 2>&1 &
+          PID_NESDEKK=$!
+
+          FAIL=0
+
+          wait $PID_KLETTUR || FAIL=1
+          wait $PID_MITRA || FAIL=1
+          wait $PID_NESDEKK || FAIL=1
+
+          echo "===== Klettur log tail ====="
+          tail -n 80 klettur.log || true
+
+          echo "===== Mitra log tail ====="
+          tail -n 80 mitra.log || true
+
+          echo "===== Nesdekk log tail ====="
+          tail -n 80 nesdekk.log || true
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::At least one spider failed."
+            exit 1
+          fi
+
+          python - <<'PY'
+          import json
+
+          files = {
+              "Klettur": "klettur.json",
+              "Mitra": "mitra.json",
+              "Nesdekk": "nesdekk.json",
+          }
+
+          for name, path in files.items():
+              with open(path, encoding="utf-8") as f:
+                  data = json.load(f)
+              print(f"{name} raw: {len(data)}")
+              if len(data) == 0:
+                  raise SystemExit(f"{name} returned 0 rows")
+          PY
 
       - name: Create empty N1 file
         run: |
