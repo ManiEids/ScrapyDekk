@@ -11,7 +11,6 @@ on:
     # Once per day at 03:17 Iceland time / UTC
     - cron: '17 3 * * *'
 
-  # Allows manual "Run workflow" from GitHub Actions
   workflow_dispatch: {}
 
 permissions:
@@ -73,8 +72,4 @@ jobs:
 
       - name: Nudge WordPress import
         run: |
-<<<<<<< HEAD
           curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
-=======
-          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
->>>>>>> 7fafea4a753cb634ec59049b3238a9985a78f1c3
