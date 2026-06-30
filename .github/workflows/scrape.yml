@@ -1,11 +1,19 @@
 # .github/workflows/scrape.yml
+# Scrapes tire sources slowly and safely, merges them into combined_tire_data.json,
+# publishes the JSON as a rolling GitHub Release asset,
+# and nudges WordPress to import the newest feed.
 
 name: Scrape tires & publish feed
 
 on:
   schedule:
+    # Once per day at 03:17 Iceland time / UTC
     - cron: '17 3 * * *'
+
+  # Manual "Run workflow" button
   workflow_dispatch: {}
+
+  # Run when scraper/feed code changes
   push:
     branches: [ main ]
     paths:
@@ -29,69 +37,102 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           set -e
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Klettur
+      - name: Run Klettur slowly
         run: |
           set -e
-          scrapy crawl klettur -O klettur.json
-          python -c "import json; d=json.load(open('klettur.json')); print('Klettur raw:', len(d)); assert len(d) > 0"
+          scrapy crawl klettur -O klettur.json \
+            -s CONCURRENT_REQUESTS=2 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
+            -s DOWNLOAD_DELAY=1.5 \
+            -s AUTOTHROTTLE_ENABLED=True \
+            -s AUTOTHROTTLE_START_DELAY=1 \
+            -s AUTOTHROTTLE_MAX_DELAY=8 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
+          python -c "import json; d=json.load(open('klettur.json', encoding='utf-8')); print('Klettur raw:', len(d)); assert len(d) > 0"
 
-      - name: Run Mitra
+      - name: Run Mitra slowly
         run: |
           set -e
-          scrapy crawl mitra -O mitra.json
-          python -c "import json; d=json.load(open('mitra.json')); print('Mitra raw:', len(d)); assert len(d) > 0"
+          scrapy crawl mitra -O mitra.json \
+            -s CONCURRENT_REQUESTS=2 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
+            -s DOWNLOAD_DELAY=1 \
+            -s AUTOTHROTTLE_ENABLED=True \
+            -s AUTOTHROTTLE_START_DELAY=1 \
+            -s AUTOTHROTTLE_MAX_DELAY=8 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
+          python -c "import json; d=json.load(open('mitra.json', encoding='utf-8')); print('Mitra raw:', len(d)); assert len(d) > 0"
 
-      - name: Run Nesdekk
+      - name: Run Nesdekk slowly
         run: |
           set -e
-          scrapy crawl nesdekk -O nesdekk.json
-          python -c "import json; d=json.load(open('nesdekk.json')); print('Nesdekk raw:', len(d)); assert len(d) > 0"
+          scrapy crawl nesdekk -O nesdekk.json \
+            -s CONCURRENT_REQUESTS=1 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
+            -s DOWNLOAD_DELAY=2 \
+            -s AUTOTHROTTLE_ENABLED=True \
+            -s AUTOTHROTTLE_START_DELAY=1 \
+            -s AUTOTHROTTLE_MAX_DELAY=10 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
+          python -c "import json; d=json.load(open('nesdekk.json', encoding='utf-8')); print('Nesdekk raw:', len(d)); assert len(d) > 0"
 
-      - name: Run N1
+      - name: Run N1 slowly
         run: |
           set -e
-          scrapy crawl n1 -O n1.json
-          python -c "import json; d=json.load(open('n1.json')); print('N1 raw:', len(d)); assert len(d) > 0"
+          scrapy crawl n1 -O n1.json \
+            -s CONCURRENT_REQUESTS=1 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
+            -s DOWNLOAD_DELAY=2 \
+            -s AUTOTHROTTLE_ENABLED=True \
+            -s AUTOTHROTTLE_START_DELAY=1 \
+            -s AUTOTHROTTLE_MAX_DELAY=10 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
+          python -c "import json; d=json.load(open('n1.json', encoding='utf-8')); print('N1 raw:', len(d)); assert len(d) > 0"
 
-      - name: Merge
+      - name: Merge tire data
         run: |
           set -e
           python merge_tires.py
 
-      - name: Validate merged feed by seller
+      - name: Validate merged feed
         run: |
           set -e
           python - <<'PY'
           import json
           from collections import Counter
 
-          d = json.load(open("combined_tire_data.json", encoding="utf-8"))
-          counts = Counter(x.get("seller") for x in d)
+          with open("combined_tire_data.json", encoding="utf-8") as f:
+              data = json.load(f)
 
-          print("Merged total:", len(d))
+          counts = Counter(item.get("seller") for item in data)
+
+          print("Merged total:", len(data))
           for seller in ["Klettur", "Mitra", "Nesdekk", "N1"]:
               print(f"{seller}: {counts.get(seller, 0)}")
 
-          required = ["Klettur", "Mitra", "Nesdekk", "N1"]
-          missing = [s for s in required if counts.get(s, 0) == 0]
+          missing = [seller for seller in ["Klettur", "Mitra", "Nesdekk", "N1"] if counts.get(seller, 0) == 0]
 
           if missing:
-              raise SystemExit(f"Refusing to publish. Missing sellers: {', '.join(missing)}")
+              raise SystemExit(f"Refusing to publish. Missing seller data: {', '.join(missing)}")
 
-          if len(d) < 4000:
-              raise SystemExit(f"Refusing to publish suspiciously small feed: {len(d)} rows")
+          if len(data) < 4000:
+              raise SystemExit(f"Refusing to publish suspiciously small feed: {len(data)} rows")
+
+          print("Feed validation passed.")
           PY
 
       - name: Publish feed as rolling Release asset
