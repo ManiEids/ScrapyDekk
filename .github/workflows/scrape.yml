@@ -135,6 +135,6 @@ jobs:
           files: combined_tire_data.json
           fail_on_unmatched_files: true
 
-      - name: Nudge WordPress import
+      - name: Trigger WordPress feed import
         run: |
-          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php" >/dev/null || true
+          curl -fsS --max-time 90 -X POST "$WP_SITE/wp-json/dts/v1/sync?key=${{ secrets.DTS_SYNC_SECRET }}"
