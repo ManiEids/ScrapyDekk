@@ -1,68 +1,80 @@
-# Scrapes the three tire sources, merges, and publishes combined_tire_data.json
-# as a rolling GitHub Release asset that the WordPress plugin pulls from.
-# No secrets required.
+# .github/workflows/scrape.yml
+# Scrapes ALL FOUR tire sources from a self-hosted runner on your Proxmox lab
+# (Icelandic IP -> sites return the full catalogue), merges, and publishes
+# combined_tire_data.json as a rolling GitHub Release asset that WordPress pulls.
 
 name: Scrape tires & publish feed
 
 on:
   schedule:
-    - cron: '17 */6 * * *'   # every 6 hours at :17 UTC (avoids top-of-hour congestion)
-  workflow_dispatch: {}        # manual "Run workflow" button in the Actions tab
+    - cron: '17 */6 * * *'       # every 6h at :17 UTC
+  workflow_dispatch: {}            # manual "Run workflow" button
+  push:                            # publish immediately when scraper code changes
+    branches: [ main ]
+    paths:
+      - 'Leita/**'
+      - 'merge_tires.py'
+      - 'requirements.txt'
+      - '.github/workflows/scrape.yml'
 
 permissions:
-  contents: write              # required to create/update the Release asset
+  contents: write                  # required to update the Release asset
 
 concurrency:
-  group: tire-scrape           # never let two scrapes overlap
+  group: tire-scrape               # never overlap two scrapes
   cancel-in-progress: false
 
 env:
   WP_SITE: https://dekkjahusid.is
+  MIN_TIRES: '4000'                # safety floor: refuse to publish a partial scrape over a good feed
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    # Your Proxmox runner = Icelandic IP = full results.
+    # Swap to 'ubuntu-latest' only if you want the (incomplete) GitHub-hosted fallback.
+    runs-on: [self-hosted, linux]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run spiders
+      - name: Install deps (isolated venv)
         run: |
           set -e
-          # -O overwrites output file (vs -o which appends and would corrupt JSON on rerun)
-          scrapy crawl klettur -O klettur.json  -s CONCURRENT_REQUESTS=8
-          scrapy crawl mitra   -O mitra.json    -s CONCURRENT_REQUESTS=8
-          scrapy crawl nesdekk -O nesdekk.json  -s CONCURRENT_REQUESTS=4 -s DOWNLOAD_DELAY=0.5
-          scrapy crawl n1      -O n1.json       -s CONCURRENT_REQUESTS=4
+          python3 -m venv .venv               # venv keeps the persistent runner clean + avoids PEP-668
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run all 4 spiders
+        run: |
+          set -e
+          . .venv/bin/activate
+          # -O OVERWRITES the output file (vs -o which appends and would corrupt the JSON on rerun)
+          scrapy crawl klettur -O klettur.json -s CONCURRENT_REQUESTS=16 -s CONCURRENT_REQUESTS_PER_DOMAIN=16
+          scrapy crawl mitra   -O mitra.json   -s CONCURRENT_REQUESTS=8
+          scrapy crawl nesdekk -O nesdekk.json -s CONCURRENT_REQUESTS=4 -s DOWNLOAD_DELAY=0.5
+          scrapy crawl n1      -O n1.json      -s CONCURRENT_REQUESTS=8   # <- was missing entirely
 
       - name: Merge
-        run: python merge_tires.py
-
-      - name: Sanity check output
         run: |
-          test -f combined_tire_data.json
+          . .venv/bin/activate
+          python merge_tires.py
+
+      - name: Sanity check (protect the live feed)
+        run: |
+          . .venv/bin/activate
           COUNT=$(python -c "import json; print(len(json.load(open('combined_tire_data.json'))))")
           echo "Merged $COUNT tires"
-          if [ "$COUNT" -lt 50 ]; then
-            echo "::error::Only $COUNT tires merged — refusing to publish."
+          if [ "$COUNT" -lt "$MIN_TIRES" ]; then
+            echo "::error::Only $COUNT tires (< $MIN_TIRES) -- refusing to publish; keeping last good feed."
             exit 1
           fi
 
       - name: Publish feed as a rolling Release asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: tire-feed
+          tag_name: tire-feed              # fixed tag -> stable download URL
           name: Tire feed (latest)
           files: combined_tire_data.json
 
       - name: Nudge WordPress to import now
-        run: |
-          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron" >/dev/null || true
+        run: curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
