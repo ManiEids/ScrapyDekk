@@ -14,7 +14,7 @@ A WordPress plugin on [dekkjahusid.is](https://dekkjahusid.is) pulls that asset 
 
 ## Automated runs
 
-A GitHub Actions workflow ([`.github/workflows/scrape.yml`](.github/workflows/scrape.yml)) runs every 6 hours and publishes the merged feed to the **tire-feed** release tag. No secrets are required.
+A GitHub Actions workflow ([`.github/workflows/scrape.yml`](.github/workflows/scrape.yml)) runs every 24 hours and publishes the merged feed to the **tire-feed** release tag. No secrets are required.
 
 You can also trigger a run manually from the **Actions** tab → **Scrape tires & publish feed** → **Run workflow**.
 
