@@ -73,4 +73,8 @@ jobs:
 
       - name: Nudge WordPress import
         run: |
+<<<<<<< HEAD
           curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
+=======
+          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
+>>>>>>> 7fafea4a753cb634ec59049b3238a9985a78f1c3
