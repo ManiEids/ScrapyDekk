@@ -156,7 +156,7 @@ jobs:
           STATUS=$?
 
           echo "===== N1 log tail ====="
-          tail -n 160 n1.log || true
+          tail -n 180 n1.log || true
 
           if [ "$STATUS" -ne 0 ]; then
             echo "::warning::N1 spider failed or timed out. Continuing with empty n1.json."
@@ -183,7 +183,7 @@ jobs:
 
           print(f"N1 raw: {len(data)}")
           if len(data) == 0:
-              print("::warning::N1 returned 0 rows. Continuing without N1.")
+              print("::warning::N1 returned 0 rows. Check the N1 log tail above.")
           PY
 
       - name: Merge tire data

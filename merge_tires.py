@@ -272,6 +272,79 @@ _BLOCKED_MANUFACTURERS = {
 _BLOCKED_MANUFACTURERS_LOWER = {m.lower() for m in _BLOCKED_MANUFACTURERS}
 
 
+def _manufacturer_key(value):
+    """
+    Normalize a manufacturer name for blocking checks.
+    Input:  "Hi Fly", "Hi-Fly", "DoubleCoin", "General Tire"
+    Output: lowercase comparable key with punctuation/spaces normalized.
+    """
+    if value is None:
+        return ""
+    value = str(value).strip().lower()
+    value = value.replace("&", " and ")
+    value = re.sub(r"[\u2010-\u2015_/-]+", " ", value)  # hyphen, slash, underscore variants
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
+
+
+_BLOCKED_MANUFACTURER_KEYS = {_manufacturer_key(m) for m in _BLOCKED_MANUFACTURERS}
+_BLOCKED_MANUFACTURER_COMPACT_KEYS = {k.replace(" ", "") for k in _BLOCKED_MANUFACTURER_KEYS}
+
+
+def blocked_manufacturer_reason(manufacturer):
+    """
+    Return a readable reason if the manufacturer should be blocked.
+    Handles exact, spacing, hyphen, combined-name, and prefix variants.
+    """
+    key = _manufacturer_key(manufacturer)
+    if not key:
+        return None
+
+    compact = key.replace(" ", "")
+
+    for blocked_key in _BLOCKED_MANUFACTURER_KEYS:
+        blocked_compact = blocked_key.replace(" ", "")
+
+        # Exact normalized match: "rockblade" == "rockblade"
+        if key == blocked_key:
+            return f"blocked manufacturer: {manufacturer}"
+
+        # Space/hyphen variant: "hi fly" == "hifly", "double coin" == "doublecoin"
+        if compact == blocked_compact:
+            return f"blocked manufacturer: {manufacturer}"
+
+        # Prefix variant from scraper noise: "rockblade rock as", "general tire", "bkt agrimax"
+        if key.startswith(blocked_key + " "):
+            return f"blocked manufacturer prefix: {manufacturer}"
+
+        # Compact prefix variant: "goodridewestlake", only for meaningful brand length.
+        if len(blocked_compact) >= 4 and compact.startswith(blocked_compact):
+            return f"blocked manufacturer prefix: {manufacturer}"
+
+    return None
+
+
+def blocked_item_reason(item):
+    """
+    Block using the normalized manufacturer field first.
+    If manufacturer is missing or badly parsed, try extracting brand from product_name.
+    """
+    reason = blocked_manufacturer_reason(item.get("manufacturer"))
+    if reason:
+        return reason
+
+    product_name = item.get("product_name") or ""
+    for candidate in (
+        extract_manufacturer_from_n1_name(product_name),
+        extract_manufacturer_from_name(product_name),
+    ):
+        reason = blocked_manufacturer_reason(candidate)
+        if reason:
+            return reason + " from product_name"
+
+    return None
+
+
 _NON_TIRE_KEYWORDS = [
     # Accessories / tools
     'slanga', 'ventill', 'felga', 'felgur', 'viðgerð',
@@ -308,8 +381,7 @@ def is_valid_tire(item):
     if any(k in name for k in _NON_TIRE_KEYWORDS):
         return False
 
-    mfr = (item.get("manufacturer") or "").lower()
-    if mfr in _BLOCKED_MANUFACTURERS_LOWER:
+    if blocked_item_reason(item):
         return False
 
     # Klettur stores the truck-tire category as season="Vörubíladekk" in their API.
@@ -358,9 +430,9 @@ def drop_reason(item):
         if k in name:
             return f"keyword: {k}"
 
-    mfr = (item.get("manufacturer") or "").lower()
-    if mfr in _BLOCKED_MANUFACTURERS_LOWER:
-        return f"blocked manufacturer: {item.get('manufacturer')}"
+    blocked_reason = blocked_item_reason(item)
+    if blocked_reason:
+        return blocked_reason
 
     if "vörubíladekk" in (item.get("season") or "").lower():
         return "season field is Vörubíladekk (truck tire from Klettur API)"

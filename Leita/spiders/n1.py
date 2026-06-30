@@ -24,36 +24,55 @@ import scrapy
 APP_ID = os.environ.get("N1_ALGOLIA_APP_ID", "LU6HO9UFWF")
 API_KEY = os.environ.get("N1_ALGOLIA_SEARCH_KEY", "1fc8f9f8099e352754bc2d197f6f12a8")
 INDEX_NAME = os.environ.get("N1_ALGOLIA_INDEX", "PROD_PRODUCTS")
+ALGOLIA_HOST = f"{APP_ID.lower()}-dsn.algolia.net"
 
 
 class N1AlgoliaSpider(scrapy.Spider):
     name = "n1"
 
     allowed_domains = [
-        f"{APP_ID.lower()}-dsn.algolia.net",
+        ALGOLIA_HOST,
         f"{APP_ID.lower()}.algolia.net",
     ]
 
-    ALGOLIA_URL = f"https://{APP_ID}-dsn.algolia.net/1/indexes/{INDEX_NAME}/query"
+    ALGOLIA_URL = f"https://{ALGOLIA_HOST}/1/indexes/{INDEX_NAME}/query"
 
     CATEGORY_LVL1 = "Hjólbarðar og tengdar vörur > Fólksbíla- og jeppadekk"
+    CATEGORY_LVL2_VALUES = [
+        "Hjólbarðar og tengdar vörur > Fólksbíla- og jeppadekk > Sumardekk",
+        "Hjólbarðar og tengdar vörur > Fólksbíla- og jeppadekk > Vetrardekk",
+        "Hjólbarðar og tengdar vörur > Fólksbíla- og jeppadekk > Heilsársdekk",
+    ]
 
     RIM_VALUES = [str(n) for n in range(12, 25)]
 
-    WIDTH_VALUES = [
+    METRIC_WIDTH_VALUES = [
         "125", "135", "145", "155", "165", "175", "185", "195",
         "205", "215", "225", "235", "245", "255", "265", "275",
         "285", "295", "305", "315", "325", "335", "345", "355",
     ]
 
-    PROFILE_VALUES = [
+    METRIC_PROFILE_VALUES = [
         "25", "30", "35", "40", "45", "50", "55", "60",
         "65", "70", "75", "80", "85", "90", "95",
     ]
 
+    # Flotation/off-road sizes can appear in Algolia facets as inch values.
+    # Examples: 33x12.5R15 may be stored as diameter=33 and/or section=12.5.
+    INCH_DIAMETER_VALUES = [str(n) for n in range(28, 45)]
+    INCH_SECTION_VALUES = [
+        "8", "8.5", "9", "9.5", "10", "10.5", "11", "11.5",
+        "12", "12.5", "13", "13.5", "14", "14.5", "15", "15.5", "16",
+        "8,5", "9,5", "10,5", "11,5", "12,5", "13,5", "14,5", "15,5",
+    ]
+
+    WIDTH_VALUES = METRIC_WIDTH_VALUES + INCH_DIAMETER_VALUES + INCH_SECTION_VALUES
+    PROFILE_VALUES = METRIC_PROFILE_VALUES + INCH_DIAMETER_VALUES + INCH_SECTION_VALUES
+
     # Start with the passenger/jeep category, then split by tire dimensions.
     # This avoids Algolia's 1000-hit retrieval cap without needing backend.n1.is.
     SPLIT_STEPS = [
+        ("hierarchical_categories.lvl2", CATEGORY_LVL2_VALUES),
         ("attributes.ProductTireSidewallSize", RIM_VALUES),
         ("attributes.ProductTireSectionWidthName", WIDTH_VALUES),
         ("attributes.ProductTireTreadProfile", PROFILE_VALUES),
@@ -93,7 +112,7 @@ class N1AlgoliaSpider(scrapy.Spider):
         re.IGNORECASE,
     )
     FLOTATION_NAME_RE = re.compile(
-        r"^\s*(?P<rim>\d{2})\s+R\s+(?P<diameter>\d{2})x(?P<section>\d{2}(?:[.,]\d+)?)\b",
+        r"^\s*(?P<rim>\d{2})\s+R\s+(?P<diameter>\d{2})x(?P<section>\d{1,2}(?:[.,]\d+)?)\b",
         re.IGNORECASE,
     )
     SIZE_PREFIX_RE = re.compile(
@@ -279,11 +298,18 @@ class N1AlgoliaSpider(scrapy.Spider):
         profile = self._clean_dimension(attributes.get("ProductTireTreadProfile"))
         rim = self._clean_dimension(attributes.get("ProductTireSidewallSize"))
 
-        size = None
-        if width and profile and rim:
+        size_type = "metric"
+        flotation_size = self._flotation_size_from_name(name)
+        if flotation_size:
+            # Prefer the product-name flotation size over Algolia tire attributes.
+            # N1 names are rim-first: "15 R 33X12.5 Brand...".
+            # The canonical value below is easier to debug: "33x12.5R15".
+            size = flotation_size
+            size_type = "flotation"
+        elif width and profile and rim:
             size = f"{width}/{profile}/{rim}"
         else:
-            size = self._size_from_name(name)
+            size = self._metric_size_from_name(name)
 
         season = self._season_from_hit(hit)
         manufacturer = self._manufacturer_from_name(name)
@@ -297,6 +323,7 @@ class N1AlgoliaSpider(scrapy.Spider):
             "name": name,
             "manufacturer": manufacturer,
             "size": size,
+            "size_type": size_type,
             "picture": picture,
             "stock": stock,
             "season": season,
@@ -334,17 +361,21 @@ class N1AlgoliaSpider(scrapy.Spider):
         value = str(value).strip().replace(",", ".")
         return value or None
 
-    def _size_from_name(self, name):
+    def _metric_size_from_name(self, name):
         metric = self.METRIC_NAME_RE.search(name)
         if metric:
             return f"{metric.group('width')}/{metric.group('profile')}/{metric.group('rim')}"
+        return None
 
-        # For flotation jeep tires, merge_tires.py parses the full product name.
-        # Returning None here is intentional.
-        if self.FLOTATION_NAME_RE.search(name):
+    def _flotation_size_from_name(self, name):
+        match = self.FLOTATION_NAME_RE.search(name)
+        if not match:
             return None
 
-        return None
+        rim = match.group("rim")
+        diameter = match.group("diameter")
+        section = match.group("section").replace(",", ".")
+        return f"{diameter}x{section}R{rim}"
 
     def _manufacturer_from_name(self, name):
         rest = self.SIZE_PREFIX_RE.sub("", name, count=1).strip()
