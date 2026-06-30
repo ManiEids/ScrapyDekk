@@ -8,6 +8,7 @@ spiders = [
     "klettur",
     "mitra",
     "nesdekk",
+    "n1",
 ]
 
 PROJECT_DIR = Path(__file__).parent

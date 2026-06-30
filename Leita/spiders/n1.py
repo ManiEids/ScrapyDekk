@@ -2,7 +2,7 @@ import scrapy
 import json
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-# Ná í gildi eiginda
+
 def extract_attribute_value(attributes, slug):
     for attr in attributes:
         if attr.get("attribute", {}).get("slug") == slug:
@@ -11,7 +11,7 @@ def extract_attribute_value(attributes, slug):
                 return values[0].get("value")
     return None
 
-# Ná í slóð myndar
+
 def extract_picture(variants):
     for variant in variants:
         media_list = variant.get("media", [])
@@ -20,7 +20,7 @@ def extract_picture(variants):
             return image_info.get("productList") or image_info.get("productGallery")
     return None
 
-# Ná í fyrsta SKU afbrigðis
+
 def get_first_variant_sku(product):
     variants = product.get("variants", [])
     if variants:
@@ -28,7 +28,7 @@ def get_first_variant_sku(product):
         return metadata.get("sku")
     return None
 
-# Athuga hvort sé til á lager
+
 def is_in_stock(product):
     variants = product.get("variants", [])
     for variant in variants:
@@ -37,43 +37,58 @@ def is_in_stock(product):
             return True
     return False
 
+
 class N1FullCatalogueSpider(scrapy.Spider):
     name = "n1"
     allowed_domains = ["backend.n1.is"]
 
+    API_URL = "https://backend.n1.is/api/products/attribute_filter/?page_size=24&page=1"
+
+    # Broad category that was confirmed working.
+    CATEGORY_SLUG = "004-hjolbardar-og-tengdar-vorur"
+
+    # Map substrings of product.category.slug → season label.
+    SLUG_SEASON_MAP = {
+        "sumardekk":  "Sumardekk",
+        "vetrardekk": "Vetrardekk",
+        "heilsarsdekk": "Heilsársdekk",
+    }
+
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Content-Type": "application/json",
+        "Origin": "https://vefverslun.n1.is",
+        "Referer": "https://vefverslun.n1.is/voruflokkur/hjolbardar-og-tengdar-vorur",
+        "Accept": "*/*",
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seen_skus = set()
+
     def start_requests(self):
-        payload = {
-            "attributes": [],
-            "categorySlug": "004-hjolbardar-og-tengdar-vorur"
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Content-Type": "application/json",
-            "Origin": "https://vefverslun.n1.is",
-            "Referer": "https://vefverslun.n1.is/voruflokkur/hjolbardar-og-tengdar-vorur",
-            "Accept": "*/*"
-        }
-        body = json.dumps(payload)
-        url = "https://backend.n1.is/api/products/attribute_filter/?page_size=24&page=1"
+        payload = json.dumps({"attributes": [], "categorySlug": self.CATEGORY_SLUG})
         yield scrapy.Request(
-            url=url,
+            url=self.API_URL,
             method="POST",
-            headers=headers,
-            body=body,
+            headers=self.HEADERS,
+            body=payload,
             callback=self.parse,
-            meta={"payload_body": body, "payload_headers": headers}
+            meta={
+                "payload_headers": self.HEADERS,
+                "payload_body": payload,
+            },
         )
 
     def parse(self, response):
-        self.logger.info(f"Received response {response.status} from {response.url}")
+        self.logger.info(f"Response {response.status} — {response.url}")
         try:
             data = response.json()
         except Exception as e:
-            self.logger.error("Error parsing JSON: " + str(e))
+            self.logger.error(f"JSON error: {e}")
             return
 
         results = data.get("results", [])
-        self.logger.info(f"Found {len(results)} products on this page.")
 
         candidate_products = []
         skus = []
@@ -82,82 +97,85 @@ class N1FullCatalogueSpider(scrapy.Spider):
             if not is_in_stock(product):
                 continue
 
+            sku = get_first_variant_sku(product)
+            if not sku or sku in self.seen_skus:
+                continue
+            self.seen_skus.add(sku)
+
             product_name = product.get("name")
             attributes = product.get("attributes", [])
             manufacturer = extract_attribute_value(attributes, "ProductManufacturer")
 
-            width = extract_attribute_value(attributes, "ProductTireSectionWidthName")
-            profile = extract_attribute_value(attributes, "ProductTireTreadProfile")
+            width    = extract_attribute_value(attributes, "ProductTireSectionWidthName")
+            profile  = extract_attribute_value(attributes, "ProductTireTreadProfile")
             sidewall = extract_attribute_value(attributes, "ProductTireSidewallSize")
-            size = None
-            if width and profile and sidewall:
-                size = f"{width}/{profile}/{sidewall}"
+            size = f"{width}/{profile}/{sidewall}" if (width and profile and sidewall) else None
 
             variants = product.get("variants", [])
             picture = extract_picture(variants)
-            sku = get_first_variant_sku(product)
-            if not sku:
-                continue
+
+            # Try to extract season from the product's own category slug
+            season = ""
+            cat_slug = (product.get("category") or {}).get("slug", "").lower()
+            for key, label in self.SLUG_SEASON_MAP.items():
+                if key in cat_slug:
+                    season = label
+                    break
 
             candidate_products.append({
-                "name": product_name,
-                "manufacturer": manufacturer,
-                "size": size,
-                "picture": picture,
-                "stock": "in stock",
-                "sku": sku
+                "name":          product_name,
+                "manufacturer":  manufacturer,
+                "size":          size,
+                "picture":       picture,
+                "stock":         "in stock",
+                "season":        season,
+                "sku":           sku,
+                "category_slug": cat_slug,
             })
             skus.append(sku)
 
         if skus:
-            multiprice_url = "https://backend.n1.is/api/products/multiprice/?" + "&".join([f"skus={sku}" for sku in skus])
+            multiprice_url = (
+                "https://backend.n1.is/api/products/multiprice/?"
+                + "&".join(f"skus={sku}" for sku in skus)
+            )
             yield scrapy.Request(
                 url=multiprice_url,
                 callback=self.parse_multiprice,
-                meta={"products": candidate_products}
+                meta={"products": candidate_products},
             )
-        else:
-            self.logger.info("No candidate products on this page after filtering.")
 
+        # Pagination
         parsed = urlparse(response.url)
         qs = parse_qs(parsed.query)
         current_page = int(qs.get("page", [1])[0])
         if results:
-            next_page_number = current_page + 1
-            qs["page"] = [str(next_page_number)]
-            new_query = urlencode(qs, doseq=True)
-            next_page_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-            self.logger.info(f"Following next page: {next_page_url}")
+            qs["page"] = [str(current_page + 1)]
+            next_url = urlunparse((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.params, urlencode(qs, doseq=True), parsed.fragment,
+            ))
             yield scrapy.Request(
-                url=next_page_url,
+                url=next_url,
                 method="POST",
                 headers=response.meta["payload_headers"],
                 body=response.meta["payload_body"],
                 callback=self.parse,
-                meta=response.meta
+                meta=response.meta,
             )
-        else:
-            self.logger.info("No more results, stopping pagination.")
 
     def parse_multiprice(self, response):
         try:
             price_data = response.json()
         except Exception as e:
-            self.logger.error("Error parsing multiprice JSON: " + str(e))
+            self.logger.error(f"Multiprice JSON error: {e}")
             return
 
-        products = response.meta["products"]
-        price_map = {}
-        for entry in price_data:
-            sku = entry.get("itemId")
-            price_map[sku] = entry
+        price_map = {entry.get("itemId"): entry for entry in price_data}
 
-        for prod in products:
-            sku = prod["sku"]
+        for prod in response.meta["products"]:
+            sku = prod.pop("sku", None)
             price_info = price_map.get(sku)
-            if price_info:
-                prod["price"] = price_info.get("price", "N/A")
-            else:
-                prod["price"] = "N/A"
-            prod.pop("sku", None)
+            prod["price"] = price_info.get("price", "N/A") if price_info else "N/A"
+            prod["source"] = "n1.is"
             yield prod

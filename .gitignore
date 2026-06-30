@@ -49,3 +49,5 @@ Thumbs.db
 *.json
 __pycache__/
 *.pyc
+__pycache__/
+*.py[cod]

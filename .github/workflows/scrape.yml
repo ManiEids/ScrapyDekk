@@ -41,6 +41,7 @@ jobs:
           scrapy crawl klettur -O klettur.json  -s CONCURRENT_REQUESTS=8
           scrapy crawl mitra   -O mitra.json    -s CONCURRENT_REQUESTS=8
           scrapy crawl nesdekk -O nesdekk.json  -s CONCURRENT_REQUESTS=4 -s DOWNLOAD_DELAY=0.5
+          scrapy crawl n1      -O n1.json       -s CONCURRENT_REQUESTS=4
 
       - name: Merge
         run: python merge_tires.py

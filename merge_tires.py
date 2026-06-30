@@ -63,21 +63,44 @@ def parse_size(size_str):
     return None, None, None
 
 
+_JUNK_TOKEN_RE = re.compile(r'^\d+([.,]\d+)?"?$')  # e.g. 35, 35", 12,50
+
+def _is_junk_token(tok):
+    # Pure number/inch-annotation OR 1-2 uppercase letter season/load code
+    return bool(_JUNK_TOKEN_RE.match(tok) or re.match(r'^[A-Z]{1,2}$', tok, re.IGNORECASE))
+
+
 def extract_manufacturer_from_name(name):
     """
     Fallback manufacturer extraction from Klettur product names.
-    E.g. "205/55R16 S Nexen N-Blue HD Plus Sumardekk 91H" → "Nexen"
+    Handles metric:   "205/55R16 S Nexen N-Blue HD Plus 91H"       → "Nexen"
+    And flotation:    "35x12,50R17 S Zeta Fortrak MT 121Q"         → "Zeta"
+    And inch-annot:   "285/75R18 35\" S Goodyear Wrl DuraTrac 129Q" → "Goodyear"
     """
     if not name:
         return None
     size_match = re.search(r'\d{3}/\d{2,3}[A-Z]?\d{2}[A-Z]*\s+', name)
     if not size_match:
+        # R is mandatory; allow trailing letter suffix (LT, C, E) before whitespace
+        size_match = re.search(r'\d{2}x\d{2}[,.]?\d*R\d{2}[A-Z]*\s+', name, re.IGNORECASE)
+    if not size_match:
         return None
-    after_size = name[size_match.end():]
-    season_match = re.match(r'[A-Z]{1,2}\s+', after_size)
-    after_season = after_size[season_match.end():] if season_match else after_size
-    parts = after_season.split()
-    return parts[0] if parts else None
+    tokens = name[size_match.end():].split()
+    for tok in tokens:
+        if not _is_junk_token(tok):
+            return tok
+    return None
+
+
+# N1 names: "{rim} R {width}/{aspect} {Manufacturer} {rest}"
+# E.g. "19 R 245/55 Michelin X-Ice North 4 SUV 107T TL" → "Michelin"
+_N1_NAME_RE = re.compile(r'\d+\s+R\s+\d{3}/\d{2,3}\s+(\S+)', re.IGNORECASE)
+
+def extract_manufacturer_from_n1_name(name):
+    if not name:
+        return None
+    m = _N1_NAME_RE.search(name)
+    return m.group(1) if m else None
 
 
 def normalize_season(season):
@@ -94,15 +117,155 @@ def normalize_season(season):
     return season  # return original if unrecognised
 
 
-def is_valid_tire(item):
+# Values that look like a manufacturer but aren't one.
+# Matched case-insensitively; any match → manufacturer set to None.
+_MFR_JUNK = {
+    "annað",    # Icelandic "other / misc"
+    "sólað",    # retread category (neutral form)
+    "sóluð",    # retread category (feminine form)
+    "x",        # single-letter; appears on Michelin X-line tires, not a real brand
+    "velocity", # Velocity = wheel brand, all their N1 rows are tire+wheel packages
+}
+
+# Tire-size strings accidentally stored as manufacturer.
+# Covers metric (130/80-17), flotation (35x12,50R17), and sizes like 35"
+_SIZE_AS_MFR_RE = re.compile(r'^\d{2,3}[./x]\d{2,3}|^\d{2,3}"', re.IGNORECASE)
+
+# Flotation/off-road size in product name: 35x12,50R17 / 33x10.50R15 / 37x12,50R20LT
+# R is mandatory — bias-ply/turf sizes like "31x15,50-15" (no R) must not match.
+# [A-Z]* allows optional LT/C/E load-range suffix directly after rim digits.
+_FLOTATION_NAME_RE = re.compile(r'\b\d{2}x\d{2}[,.]?\d*R\d{2}[A-Z]*\b', re.IGNORECASE)
+
+# Extracts the four numeric parts of a flotation size for structured output.
+# "37x12,50R20LT" → groups (37, 12, 50, 20)  diameter, width_int, width_frac, rim
+_FLOTATION_PARSE_RE = re.compile(r'\b(\d{2})x(\d{2})[,.]?(\d*)R(\d{2})', re.IGNORECASE)
+
+# Hyphen-separated sizes without R ("180/70-15", "400/50-15") indicate motorcycle/
+# agricultural/turf tires — not radial passenger/jeep tires.
+_NON_RADIAL_SIZE_IN_NAME_RE = re.compile(r'\d{3}/\d{2,3}-\d{2}', re.IGNORECASE)
+
+# Truck/commercial rim sizes appear as "R22,5" or "R17,5" in the product name.
+# Klettur stores the rim as an integer (22) so the structured rim_size field cannot
+# distinguish 22" passenger from 22.5" truck — check the name instead.
+_TRUCK_RIM_IN_NAME_RE = re.compile(r'R\d{2}[.,]5\b', re.IGNORECASE)
+
+
+def is_jeep_tire(item):
     """
-    Accept only real passenger car and light-SUV tires.
+    Returns True for flotation/off-road tires.
+    These use WIDTHxASPECTRRIM inch sizing, not the standard metric format.
     """
+    # Fast path: already classified during tire-dict construction
+    if item.get("size_type") == "flotation":
+        return True
+    # All sellers: flotation size string present in the product name
+    if _FLOTATION_NAME_RE.search(item.get("product_name") or ""):
+        return True
+    # Mitra stores flotation tires as: width = section-width in inches (8–16),
+    # aspect_ratio = outer diameter in inches (28–50)
     width  = item.get("width")
     aspect = item.get("aspect_ratio")
     rim    = item.get("rim_size")
-    price  = item.get("price")
+    if width is not None and aspect is not None and rim is not None:
+        if 8 <= width <= 16 and 28 <= aspect <= 50 and 12 <= rim <= 24:
+            return True
+    return False
 
+# Canonical name map — keyed on lower-case raw value → correct display name.
+_MFR_NORM = {
+    # Case variants
+    "goodyear":         "Goodyear",
+    "goodYear".lower(): "Goodyear",   # "goodyear" — same key, fine
+    "gy":               "Goodyear",
+    "bridgestone":      "Bridgestone",  # covers BRIDGESTONE
+    "bfgoodrich":       "BFGoodrich",   # covers Bfgoodrich + BfGoodrich
+    "doublecoin":       "Double Coin",
+    # Model name / sub-brand → parent brand
+    "dunloptrx":        "Dunlop",
+    "sailunice":        "Sailun",
+    "atrezzo":          "Sailun",       # Sailun Atrezzo is a product line
+    "gt":               "GT Radial",
+    # Combined brands → pick primary (cleaner for UI filters)
+    "zeta/pace":        "Zeta",
+    "landsail/sentury": "Landsail",
+    "sonix/ilink":      "Sonix",
+    "rapid/aoteli":     "Rapid",
+    # Incomplete / abbreviated names
+    "c":                "Maxxis",       # Klettur uses "C" for Maxxis commercial tires
+    "mickey":           "Mickey Thompson",
+    # Brand split — unify under one canonical name
+    "cooper":           "Cooper",
+    "cooper tires":     "Cooper",
+}
+
+
+def normalize_manufacturer(name):
+    if not name or not name.strip():
+        return None
+    name = name.strip()
+    lower = name.lower()
+    if lower in _MFR_JUNK:
+        return None
+    if _SIZE_AS_MFR_RE.match(name):
+        return None
+    return _MFR_NORM.get(lower, name)
+
+
+_NON_TIRE_KEYWORDS = [
+    # Accessories / tools
+    'slanga', 'ventill', 'felga', 'felgur', 'viðgerð',
+    'repair', 'sealant', 'pumpa', 'verkfæri', 'hetta', 'bolti',
+    # Tire+wheel packages (Icelandic "með felgu" = "with rim")
+    'með felgu',
+    # Truck tires
+    'vörubíladekk',
+    # Retreaded tires in product names (manufacturer normalisation catches the mfr field)
+    'sóluð', 'sólað',
+    # Non-passenger vehicle categories (Icelandic)
+    'mótorhjóladekk',   # motorcycle tire
+    'reiðhjóladekk',    # bicycle tire
+    'vinnuvéladekk',    # machinery tire
+    'sláttuvéladekk',   # lawnmower tire
+    'dráttarvéladekk',  # tractor tire
+    'hjólbörudekk',     # wheelbarrow tire
+    'grasdekk',         # turf / lawn tire
+    # Known motorcycle product lines that appear on N1 without Icelandic category words
+    'cobra chrome',     # Avon Cobra Chrome (Harley-Davidson)
+    'commander iii',    # Michelin Commander III (Harley-Davidson)
+    'anakee',           # Michelin Anakee (adventure motorcycle)
+    'roadrider',        # Avon Roadrider (classic motorcycle)
+    'maxxcross',        # Maxxis MAXXCross (motocross)
+]
+
+
+def is_valid_tire(item):
+    price = item.get("price")
+    if price is None or price < 1000:
+        return False
+
+    name = (item.get("product_name") or "").lower()
+    if any(k in name for k in _NON_TIRE_KEYWORDS):
+        return False
+
+    # Flotation/off-road (jeep) tires bypass metric dimension checks
+    if is_jeep_tire(item):
+        return True
+
+    # Truck/commercial rims appear as R22,5 / R17,5 / R19,5 in the product name.
+    # Klettur stores rim as an integer so structured rim_size field alone can't catch them.
+    if _TRUCK_RIM_IN_NAME_RE.search(item.get("product_name") or ""):
+        return False
+
+    # Null manufacturer + dash-separated size (no R) → motorcycle/agricultural/turf tire
+    # that happens to fall within metric dimension ranges. Drop it.
+    if item.get("manufacturer") is None:
+        pname = item.get("product_name") or ""
+        if _NON_RADIAL_SIZE_IN_NAME_RE.search(pname):
+            return False
+
+    width  = item.get("width")
+    aspect = item.get("aspect_ratio")
+    rim    = item.get("rim_size")
     if None in (width, aspect, rim):
         return False
     if not (125 <= width <= 355):
@@ -111,18 +274,43 @@ def is_valid_tire(item):
         return False
     if not (12 <= rim <= 24):
         return False
+    return True
+
+
+def drop_reason(item):
+    price = item.get("price")
     if price is None or price < 1000:
-        return False
+        return f"price invalid: {price}"
 
     name = (item.get("product_name") or "").lower()
-    non_tire_keywords = [
-        'slanga', 'ventill', 'felga', 'felgur', 'viðgerð',
-        'repair', 'sealant', 'pumpa', 'verkfæri', 'hetta', 'bolti',
-    ]
-    if any(k in name for k in non_tire_keywords):
-        return False
+    for k in _NON_TIRE_KEYWORDS:
+        if k in name:
+            return f"keyword: {k}"
 
-    return True
+    if is_jeep_tire(item):
+        return "valid jeep tire"  # should not appear in dropped
+
+    if _TRUCK_RIM_IN_NAME_RE.search(item.get("product_name") or ""):
+        return "truck/commercial rim size (R17.5/R19.5/R22.5)"
+
+    if item.get("manufacturer") is None:
+        pname = item.get("product_name") or ""
+        if _NON_RADIAL_SIZE_IN_NAME_RE.search(pname):
+            return "no manufacturer + non-radial size (likely non-passenger tire)"
+
+    width  = item.get("width")
+    aspect = item.get("aspect_ratio")
+    rim    = item.get("rim_size")
+    if None in (width, aspect, rim):
+        missing = [k for k, v in {"width": width, "aspect_ratio": aspect, "rim_size": rim}.items() if v is None]
+        return f"missing: {', '.join(missing)}"
+    if not (125 <= width <= 355):
+        return f"width out of range: {width}"
+    if not (25 <= aspect <= 95):
+        return f"aspect_ratio out of range: {aspect}"
+    if not (12 <= rim <= 24):
+        return f"rim_size out of range: {rim}"
+    return "unknown"
 
 
 # -----------------------------
@@ -134,6 +322,7 @@ def main():
         'Klettur':  'klettur.json',
         'Mitra':    'mitra.json',
         'Nesdekk':  'nesdekk.json',
+        'N1':       'n1.json',
     }
 
     combined = []
@@ -161,7 +350,12 @@ def main():
                 aspect       = item.get('profile')
                 rim          = item.get('rim')
                 product_name = item.get('name')
-                manufacturer = item.get('manufacturer') or extract_manufacturer_from_name(item.get('name'))
+                raw_mfr      = item.get('manufacturer')
+                # Klettur sometimes stores a flotation size (e.g., "35x12,50R17") as
+                # the manufacturer field — treat those as missing and extract from name.
+                if raw_mfr and re.match(r'^\d{2}x', raw_mfr, re.IGNORECASE):
+                    raw_mfr = None
+                manufacturer = raw_mfr or extract_manufacturer_from_name(product_name)
                 sku          = item.get('sku')
                 season       = normalize_season(item.get('season', ''))
                 price        = normalize_price(item.get('price'))
@@ -199,13 +393,32 @@ def main():
                 stock        = 'out of stock' if 'out' in raw_stock else 'in stock'
                 picture      = item.get('picture') or ''
 
+            # ── N1 ───────────────────────────────────────────────────────
+            # Spider yields: name, manufacturer, size ("205/55/16"),
+            #   picture, stock, season, price (raw number), category_slug, source
+            # No sku, no inventory (spider pre-filters to in-stock only)
+            elif seller == 'N1':
+                # N1's broad category includes motorcycle/bicycle sub-categories.
+                # Slugs are unaccented ASCII so "motordekk", "reidhjol" etc. are safe to check.
+                cat_slug = item.get('category_slug', '')
+                if any(frag in cat_slug for frag in ('motor', 'reidhjol', 'fjorhjol', 'atv')):
+                    continue
+                width, aspect, rim = parse_size(item.get('size'))
+                product_name = item.get('name')
+                manufacturer = item.get('manufacturer') or extract_manufacturer_from_n1_name(product_name)
+                sku          = None
+                season       = normalize_season(item.get('season', ''))
+                price        = normalize_price(item.get('price'))
+                stock        = item.get('stock', 'in stock')
+                picture      = item.get('picture') or ''
+
             else:
                 continue
 
             tire = {
                 "seller":          seller,
                 "sku":             sku,
-                "manufacturer":    manufacturer,
+                "manufacturer":    normalize_manufacturer(manufacturer),
                 "product_name":    product_name,
                 "width":           safe_int(width),
                 "aspect_ratio":    safe_int(aspect),
@@ -218,6 +431,27 @@ def main():
                 "source":          item.get('source', seller.lower() + '.is'),
             }
 
+            # Flotation/off-road tires: tag, override season, and extract proper dimensions
+            if is_jeep_tire(tire):
+                tire["season"]    = "Jeppadekk"
+                tire["size_type"] = "flotation"
+                fm = _FLOTATION_PARSE_RE.search(tire.get("product_name") or "")
+                if fm:
+                    frac = fm.group(3)
+                    tire["flotation_diameter"] = int(fm.group(1))
+                    tire["flotation_width"]    = round(int(fm.group(2)) + (int(frac) / 100.0 if frac else 0), 2)
+                    tire["rim_size"]           = int(fm.group(4))
+                elif seller == "Mitra":
+                    # Mitra: width field = section-width inches, aspect field = outer-diameter inches
+                    tire["flotation_diameter"] = tire.get("aspect_ratio")
+                    tire["flotation_width"]    = tire.get("width")
+                    # rim_size is already correct from the Mitra block
+                # Clear metric fields — they are meaningless / inconsistent for flotation tires
+                tire["width"]        = None
+                tire["aspect_ratio"] = None
+            else:
+                tire["size_type"] = "metric"
+
             combined.append(tire)
             if is_valid_tire(tire):
                 seller_ok += 1
@@ -225,6 +459,7 @@ def main():
         print(f"   ✅ {seller_ok} valid  |  ❌ {len(data) - seller_ok} filtered")
 
     filtered = [t for t in combined if is_valid_tire(t)]
+    dropped  = [dict(t, _drop_reason=drop_reason(t)) for t in combined if not is_valid_tire(t)]
 
     # Stats: season breakdown for the WordPress filter
     season_counts = {}
@@ -234,8 +469,11 @@ def main():
     with open('combined_tire_data.json', 'w', encoding='utf-8') as out:
         json.dump(filtered, out, ensure_ascii=False, indent=2)
 
+    with open('dropped_tire_data.json', 'w', encoding='utf-8') as out:
+        json.dump(dropped, out, ensure_ascii=False, indent=2)
+
     print(f"\n✅ Total kept:    {len(filtered)}")
-    print(f"❌ Total dropped: {len(combined) - len(filtered)}")
+    print(f"❌ Total dropped: {len(dropped)}  → dropped_tire_data.json")
     print(f"📄 Written to:    combined_tire_data.json")
     print(f"\nSeason breakdown:")
     for s, n in sorted(season_counts.items(), key=lambda x: -x[1]):
