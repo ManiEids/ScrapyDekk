@@ -1,358 +1,395 @@
+"""
+N1 Algolia Spider
+
+What it does:
+- Reads N1 tire products from N1's public Algolia search index.
+- Splits large searches by season, rim, width, and profile so Algolia's 1000-hit pagination cap is avoided.
+- Emits the raw N1 format already expected by merge_tires.py.
+
+Input:
+- Public Algolia app id/search key and PROD_PRODUCTS index.
+
+Output item fields:
+- name, manufacturer, size, picture, stock, season, price, sku, category_slug, source
+"""
+
 import json
 import os
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import re
+from urllib.parse import urlencode
 
 import scrapy
 
 
-def extract_attribute_value(attributes, slug):
-    for attr in attributes:
-        if attr.get("attribute", {}).get("slug") == slug:
-            values = attr.get("values", [])
-            if values:
-                return values[0].get("value")
-    return None
+APP_ID = os.environ.get("N1_ALGOLIA_APP_ID", "LU6HO9UFWF")
+API_KEY = os.environ.get("N1_ALGOLIA_SEARCH_KEY", "1fc8f9f8099e352754bc2d197f6f12a8")
+INDEX_NAME = os.environ.get("N1_ALGOLIA_INDEX", "PROD_PRODUCTS")
 
 
-def extract_picture(variants):
-    for variant in variants:
-        media_list = variant.get("media", [])
-        if media_list:
-            image_info = media_list[0].get("image", {})
-            return image_info.get("productList") or image_info.get("productGallery")
-    return None
-
-
-def get_first_variant_sku(product):
-    variants = product.get("variants", [])
-    if variants:
-        metadata = variants[0].get("metadata", {})
-        return metadata.get("sku")
-    return None
-
-
-def is_in_stock(product):
-    variants = product.get("variants", [])
-    for variant in variants:
-        stock = variant.get("stockLevel", {}).get("stockLevel", "").lower()
-        if stock and stock != "out of stock":
-            return True
-    return False
-
-
-class N1FullCatalogueSpider(scrapy.Spider):
+class N1AlgoliaSpider(scrapy.Spider):
     name = "n1"
 
     allowed_domains = [
-        "backend.n1.is",
-        "vefverslun.n1.is",
+        f"{APP_ID.lower()}-dsn.algolia.net",
+        f"{APP_ID.lower()}.algolia.net",
     ]
 
-    API_URL = "https://backend.n1.is/api/products/attribute_filter/?page_size=24&page=1"
-    MULTIPRICE_URL = "https://backend.n1.is/api/products/multiprice/"
-    CATEGORY_PAGE = "https://vefverslun.n1.is/voruflokkur/hjolbardar-og-tengdar-vorur"
+    ALGOLIA_URL = f"https://{APP_ID}-dsn.algolia.net/1/indexes/{INDEX_NAME}/query"
 
-    CATEGORY_SLUG = "004-hjolbardar-og-tengdar-vorur"
+    CATEGORY_LVL1 = "Hjólbarðar og tengdar vörur > Fólksbíla- og jeppadekk"
+
+    RIM_VALUES = [str(n) for n in range(12, 25)]
+
+    WIDTH_VALUES = [
+        "125", "135", "145", "155", "165", "175", "185", "195",
+        "205", "215", "225", "235", "245", "255", "265", "275",
+        "285", "295", "305", "315", "325", "335", "345", "355",
+    ]
+
+    PROFILE_VALUES = [
+        "25", "30", "35", "40", "45", "50", "55", "60",
+        "65", "70", "75", "80", "85", "90", "95",
+    ]
+
+    # Start with the passenger/jeep category, then split by tire dimensions.
+    # This avoids Algolia's 1000-hit retrieval cap without needing backend.n1.is.
+    SPLIT_STEPS = [
+        ("attributes.ProductTireSidewallSize", RIM_VALUES),
+        ("attributes.ProductTireSectionWidthName", WIDTH_VALUES),
+        ("attributes.ProductTireTreadProfile", PROFILE_VALUES),
+    ]
+
+    MAX_ALGOLIA_RETRIEVABLE_HITS = 1000
+    HITS_PER_PAGE = 1000
 
     custom_settings = {
-        # backend.n1.is/robots.txt currently returns 403 on GitHub Actions.
-        # This avoids failing before the API request.
         "ROBOTSTXT_OBEY": False,
-
-        # Be gentle.
-        "CONCURRENT_REQUESTS": 1,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
-        "DOWNLOAD_DELAY": 2,
-        "RANDOMIZE_DOWNLOAD_DELAY": True,
-
+        "CONCURRENT_REQUESTS": 4,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_DELAY": 0.05,
         "AUTOTHROTTLE_ENABLED": True,
-        "AUTOTHROTTLE_START_DELAY": 1,
-        "AUTOTHROTTLE_MAX_DELAY": 10,
-        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0,
-
-        "RETRY_TIMES": 2,
-        "RETRY_HTTP_CODES": [429, 500, 502, 503, 504],
-
-        # Let the spider see 403/429 so we can log a useful message.
-        "HTTPERROR_ALLOWED_CODES": [403, 429],
-
-        "COOKIES_ENABLED": True,
+        "AUTOTHROTTLE_START_DELAY": 0.2,
+        "AUTOTHROTTLE_MAX_DELAY": 2.0,
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
+        "RETRY_ENABLED": True,
+        "RETRY_TIMES": 4,
+        "RETRY_HTTP_CODES": [408, 429, 500, 502, 503, 504],
         "DOWNLOAD_TIMEOUT": 30,
+        "DEFAULT_REQUEST_HEADERS": {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Algolia-Application-Id": APP_ID,
+            "X-Algolia-API-Key": API_KEY,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+        },
     }
 
-    SLUG_SEASON_MAP = {
-        "sumardekk": "Sumardekk",
-        "vetrardekk": "Vetrardekk",
-        "heilsarsdekk": "Heilsársdekk",
-    }
+    METRIC_NAME_RE = re.compile(
+        r"^\s*(?P<rim>\d{2})\s+R\s+(?P<width>\d{3})/(?P<profile>\d{2,3})\b",
+        re.IGNORECASE,
+    )
+    FLOTATION_NAME_RE = re.compile(
+        r"^\s*(?P<rim>\d{2})\s+R\s+(?P<diameter>\d{2})x(?P<section>\d{2}(?:[.,]\d+)?)\b",
+        re.IGNORECASE,
+    )
+    SIZE_PREFIX_RE = re.compile(
+        r"^\s*\d{2}\s+R\s+(?:\d{3}/\d{2,3}|\d{2}x\d{2}(?:[.,]\d+)?)\s+",
+        re.IGNORECASE,
+    )
 
-    SKIP_SLUG_FRAGMENTS = frozenset({
-        "motor",
+    MULTI_WORD_BRANDS = [
+        "Mickey Thompson",
+        "Double Coin",
+        "GT Radial",
+        "General Tire",
+        "BF Goodrich",
+    ]
+
+    SKIP_CATEGORY_WORDS = [
+        "mótorhjóladekk",
+        "motorhjóladekk",
+        "reiðhjóladekk",
         "reidhjol",
+        "fjórhjól",
         "fjorhjol",
         "atv",
-        "vinnuvela",
-        "slaettuvela",
-        "grasdekk",
-        "felg",
-        "voru",
-        "slanga",
-        "ventill",
-    })
-
-    BROWSER_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "is-IS,is;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
-    }
-
-    API_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "is-IS,is;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Content-Type": "application/json",
-        "Origin": "https://vefverslun.n1.is",
-        "Referer": "https://vefverslun.n1.is/voruflokkur/hjolbardar-og-tengdar-vorur",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-    }
+        "sláttuvél",
+        "slaettuvel",
+        "vinnuvél",
+        "vinnuvel",
+        "dráttarvél",
+        "drattarvel",
+        "felgur",
+        "slöngur",
+        "slongur",
+        "ventlar",
+    ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.seen_object_ids = set()
         self.seen_skus = set()
 
-        # Optional.
-        # In GitHub Actions, set repository secret SCRAPE_PROXY like:
-        # http://user:password@host:port
-        #
-        # Only use this with permission / legitimate scraping access.
-        self.proxy = os.environ.get("SCRAPE_PROXY")
-
-    def _meta(self, extra=None):
-        meta = dict(extra or {})
-        if self.proxy:
-            meta["proxy"] = self.proxy
-        return meta
-
-    def _initial_payload(self):
-        return json.dumps({
-            "attributes": [],
-            "categorySlug": self.CATEGORY_SLUG,
-        })
-
-    def _api_request(self, url):
-        payload = self._initial_payload()
-        return scrapy.Request(
-            url=url,
-            method="POST",
-            headers=self.API_HEADERS,
-            body=payload,
-            callback=self.parse,
-            errback=self.errback_log,
-            meta=self._meta({
-                "payload_headers": self.API_HEADERS,
-                "payload_body": payload,
-                "handle_httpstatus_list": [403, 429],
-            }),
-            dont_filter=True,
-        )
-
-    async def start(self):
-        """
-        Scrapy 2.16+ entry point.
-
-        First request the public page to let cookies/session headers settle,
-        then call the backend API.
-        """
-        yield scrapy.Request(
-            url=self.CATEGORY_PAGE,
-            headers=self.BROWSER_HEADERS,
-            callback=self.after_warmup,
-            errback=self.errback_log,
-            meta=self._meta({"handle_httpstatus_list": [403, 429]}),
-            dont_filter=True,
-        )
-
-    # Backwards compatibility if you ever pin Scrapy below 2.16 again.
     def start_requests(self):
-        yield scrapy.Request(
-            url=self.CATEGORY_PAGE,
-            headers=self.BROWSER_HEADERS,
-            callback=self.after_warmup,
+        base_filters = [f"hierarchical_categories.lvl1:{self.CATEGORY_LVL1}"]
+        yield self._make_request(filters=base_filters, page=0, split_depth=0)
+
+    def _make_request(self, filters, page, split_depth):
+        params = {
+            "query": "",
+            "page": page,
+            "hitsPerPage": self.HITS_PER_PAGE,
+            "analytics": "false",
+            "clickAnalytics": "false",
+            "getRankingInfo": "false",
+            "facetFilters": json.dumps(filters, ensure_ascii=False),
+            "attributesToRetrieve": json.dumps([
+                "sku",
+                "name",
+                "categories",
+                "hierarchical_categories",
+                "attributes",
+                "media",
+                "price",
+                "stock_level",
+                "stock_level_stores",
+                "variants_stock_levels",
+                "objectID",
+            ]),
+        }
+
+        body = json.dumps({"params": urlencode(params, doseq=True)})
+
+        return scrapy.Request(
+            url=self.ALGOLIA_URL,
+            method="POST",
+            body=body,
+            callback=self.parse_search,
             errback=self.errback_log,
-            meta=self._meta({"handle_httpstatus_list": [403, 429]}),
             dont_filter=True,
+            meta={
+                "filters": filters,
+                "page": page,
+                "split_depth": split_depth,
+            },
         )
 
-    def after_warmup(self, response):
-        self.logger.info("Warmup response %s — %s", response.status, response.url)
-
-        if response.status in (403, 429):
-            self.logger.warning(
-                "N1 public warmup returned %s. Trying backend API anyway. Body preview: %r",
-                response.status,
-                response.text[:300],
-            )
-
-        yield self._api_request(self.API_URL)
-
-    def parse(self, response):
-        self.logger.info("N1 API response %s — %s", response.status, response.url)
-
-        if response.status in (403, 429):
-            self.logger.error(
-                "N1 API blocked this request with HTTP %s. Body preview: %r",
-                response.status,
-                response.text[:500],
-            )
-            return
+    def parse_search(self, response):
+        filters = response.meta["filters"]
+        page = response.meta["page"]
+        split_depth = response.meta["split_depth"]
 
         try:
             data = response.json()
-        except Exception as e:
-            self.logger.error("N1 JSON error: %s. Body preview: %r", e, response.text[:500])
+        except Exception as exc:
+            self.logger.error("N1 Algolia JSON error: %s. Body preview: %r", exc, response.text[:500])
             return
 
-        results = data.get("results", [])
-
-        candidate_products = []
-        skus = []
-
-        for product in results:
-            if not is_in_stock(product):
-                continue
-
-            sku = get_first_variant_sku(product)
-            if not sku or sku in self.seen_skus:
-                continue
-
-            product_name = product.get("name")
-            attributes = product.get("attributes", [])
-            manufacturer = extract_attribute_value(attributes, "ProductManufacturer")
-
-            width = extract_attribute_value(attributes, "ProductTireSectionWidthName")
-            profile = extract_attribute_value(attributes, "ProductTireTreadProfile")
-            sidewall = extract_attribute_value(attributes, "ProductTireSidewallSize")
-            size = f"{width}/{profile}/{sidewall}" if (width and profile and sidewall) else None
-
-            variants = product.get("variants", [])
-            picture = extract_picture(variants)
-
-            cat_slug = (product.get("category") or {}).get("slug", "").lower()
-            if any(frag in cat_slug for frag in self.SKIP_SLUG_FRAGMENTS):
-                continue
-
-            season = ""
-            for key, label in self.SLUG_SEASON_MAP.items():
-                if key in cat_slug:
-                    season = label
-                    break
-
-            self.seen_skus.add(sku)
-
-            candidate_products.append({
-                "name": product_name,
-                "manufacturer": manufacturer,
-                "size": size,
-                "picture": picture,
-                "stock": "in stock",
-                "season": season,
-                "sku": sku,
-                "category_slug": cat_slug,
-            })
-            skus.append(sku)
-
-        if skus:
-            multiprice_url = self.MULTIPRICE_URL + "?" + "&".join(
-                f"skus={sku}" for sku in skus
-            )
-
-            yield scrapy.Request(
-                url=multiprice_url,
-                headers=self.API_HEADERS,
-                callback=self.parse_multiprice,
-                errback=self.errback_log,
-                meta=self._meta({
-                    "products": candidate_products,
-                    "handle_httpstatus_list": [403, 429],
-                }),
-            )
-
-        # Pagination.
-        parsed = urlparse(response.url)
-        qs = parse_qs(parsed.query)
-        current_page = int(qs.get("page", [1])[0])
-
-        if results:
-            qs["page"] = [str(current_page + 1)]
-            next_url = urlunparse((
-                parsed.scheme,
-                parsed.netloc,
-                parsed.path,
-                parsed.params,
-                urlencode(qs, doseq=True),
-                parsed.fragment,
-            ))
-
-            yield scrapy.Request(
-                url=next_url,
-                method="POST",
-                headers=response.meta["payload_headers"],
-                body=response.meta["payload_body"],
-                callback=self.parse,
-                errback=self.errback_log,
-                meta=self._meta({
-                    "payload_headers": response.meta["payload_headers"],
-                    "payload_body": response.meta["payload_body"],
-                    "handle_httpstatus_list": [403, 429],
-                }),
-            )
-
-    def parse_multiprice(self, response):
-        self.logger.info("N1 multiprice response %s — %s", response.status, response.url)
-
-        if response.status in (403, 429):
-            self.logger.error(
-                "N1 multiprice blocked with HTTP %s. Body preview: %r",
-                response.status,
-                response.text[:500],
-            )
+        if data.get("message"):
+            self.logger.error("N1 Algolia error: %s", data.get("message"))
             return
+
+        nb_hits = int(data.get("nbHits") or 0)
+        nb_pages = int(data.get("nbPages") or 0)
+        hits = data.get("hits") or []
+
+        self.logger.info(
+            "N1 slice page=%s hits=%s nbHits=%s filters=%s",
+            page,
+            len(hits),
+            nb_hits,
+            filters,
+        )
+
+        if page == 0 and nb_hits > self.MAX_ALGOLIA_RETRIEVABLE_HITS:
+            if split_depth < len(self.SPLIT_STEPS):
+                facet_name, values = self.SPLIT_STEPS[split_depth]
+                self.logger.info(
+                    "N1 slice too large (%s). Splitting by %s into %s slices.",
+                    nb_hits,
+                    facet_name,
+                    len(values),
+                )
+                for value in values:
+                    yield self._make_request(
+                        filters=filters + [f"{facet_name}:{value}"],
+                        page=0,
+                        split_depth=split_depth + 1,
+                    )
+                return
+
+            self.logger.warning(
+                "N1 slice still has %s hits after all split levels. "
+                "Only the first %s can be reached by Algolia pagination.",
+                nb_hits,
+                self.MAX_ALGOLIA_RETRIEVABLE_HITS,
+            )
+
+        for hit in hits:
+            item = self._hit_to_item(hit)
+            if item:
+                yield item
+
+        if page == 0 and nb_pages > 1:
+            max_pages = min(
+                nb_pages,
+                (self.MAX_ALGOLIA_RETRIEVABLE_HITS + self.HITS_PER_PAGE - 1) // self.HITS_PER_PAGE,
+            )
+            for next_page in range(1, max_pages):
+                yield self._make_request(
+                    filters=filters,
+                    page=next_page,
+                    split_depth=split_depth,
+                )
+
+    def _hit_to_item(self, hit):
+        object_id = str(hit.get("objectID") or "").strip()
+        sku = str(hit.get("sku") or object_id).strip()
+
+        dedupe_key = sku or object_id
+        if dedupe_key in self.seen_skus:
+            return None
+
+        name = (hit.get("name") or "").strip()
+        if not name:
+            return None
+
+        categories = hit.get("categories") or []
+        category_text = " > ".join(str(c) for c in categories).lower()
+        if any(word in category_text for word in self.SKIP_CATEGORY_WORDS):
+            return None
+
+        if self.CATEGORY_LVL1.lower() not in category_text:
+            return None
+
+        stock = (hit.get("stock_level") or "").strip().lower()
+        if not stock or stock == "out of stock":
+            return None
+
+        price = self._clean_price(hit.get("price"))
+        if price is None:
+            return None
+
+        attributes = hit.get("attributes") or {}
+        width = self._clean_dimension(attributes.get("ProductTireSectionWidthName"))
+        profile = self._clean_dimension(attributes.get("ProductTireTreadProfile"))
+        rim = self._clean_dimension(attributes.get("ProductTireSidewallSize"))
+
+        size = None
+        if width and profile and rim:
+            size = f"{width}/{profile}/{rim}"
+        else:
+            size = self._size_from_name(name)
+
+        season = self._season_from_hit(hit)
+        manufacturer = self._manufacturer_from_name(name)
+        picture = self._picture_from_media(hit.get("media") or [])
+
+        self.seen_skus.add(dedupe_key)
+        if object_id:
+            self.seen_object_ids.add(object_id)
+
+        return {
+            "name": name,
+            "manufacturer": manufacturer,
+            "size": size,
+            "picture": picture,
+            "stock": stock,
+            "season": season,
+            "price": price,
+            "sku": sku,
+            "category_slug": category_text,
+            "source": "n1.is",
+        }
+
+    def _clean_price(self, value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+
+        text = str(value).strip().lower()
+        text = text.replace("kr", "").replace("isk", "").strip()
+        text = text.replace(" ", "")
+
+        if text.endswith(".00"):
+            text = text[:-3]
+
+        # Icelandic thousands separator: 61.990 -> 61990
+        # Decimal comma is not expected from N1, but normalize it safely.
+        text = text.replace(".", "").replace(",", ".")
 
         try:
-            price_data = response.json()
-        except Exception as e:
-            self.logger.error("Multiprice JSON error: %s. Body preview: %r", e, response.text[:500])
-            return
+            return int(float(text))
+        except (TypeError, ValueError):
+            return None
 
-        if isinstance(price_data, dict):
-            entries = price_data.get("results") or price_data.get("items") or []
-        else:
-            entries = price_data
+    def _clean_dimension(self, value):
+        if value is None:
+            return None
+        value = str(value).strip().replace(",", ".")
+        return value or None
 
-        price_map = {entry.get("itemId"): entry for entry in entries if isinstance(entry, dict)}
+    def _size_from_name(self, name):
+        metric = self.METRIC_NAME_RE.search(name)
+        if metric:
+            return f"{metric.group('width')}/{metric.group('profile')}/{metric.group('rim')}"
 
-        for prod in response.meta["products"]:
-            sku = prod.pop("sku", None)
-            price_info = price_map.get(sku)
-            prod["price"] = price_info.get("price", "N/A") if price_info else "N/A"
-            prod["source"] = "n1.is"
-            yield prod
+        # For flotation jeep tires, merge_tires.py parses the full product name.
+        # Returning None here is intentional.
+        if self.FLOTATION_NAME_RE.search(name):
+            return None
+
+        return None
+
+    def _manufacturer_from_name(self, name):
+        rest = self.SIZE_PREFIX_RE.sub("", name, count=1).strip()
+        if not rest:
+            return None
+
+        rest_lower = rest.lower()
+        for brand in self.MULTI_WORD_BRANDS:
+            if rest_lower.startswith(brand.lower()):
+                return brand.replace(" ", "") if brand == "BF Goodrich" else brand
+
+        first = rest.split()[0].strip(" ,.;:-")
+        return first or None
+
+    def _season_from_hit(self, hit):
+        attributes = hit.get("attributes") or {}
+        season = (attributes.get("ProductTireSeason") or "").strip()
+        if season:
+            return season
+
+        categories = hit.get("categories") or []
+        text = " > ".join(str(c) for c in categories).lower()
+        if "sumardekk" in text:
+            return "Sumardekk"
+        if "vetrardekk" in text or "vetrar" in text:
+            return "Vetrardekk"
+        if "heils" in text:
+            return "Heilsársdekk"
+        return ""
+
+    def _picture_from_media(self, media):
+        for image in media:
+            if not isinstance(image, dict):
+                continue
+            for key in ("product_list", "255", "product_gallery", "540", "1080", "product_gallery_2x"):
+                url = image.get(key)
+                if url:
+                    return url
+        return ""
 
     def errback_log(self, failure):
         request = failure.request
-        self.logger.error("Request failed: %s %s — %s", request.method, request.url, failure.value)
+        self.logger.error(
+            "N1 Algolia request failed: %s %s — %s",
+            request.method,
+            request.url,
+            failure.value,
+        )

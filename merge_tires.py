@@ -96,10 +96,14 @@ def extract_manufacturer_from_name(name):
 # E.g. "19 R 245/55 Michelin X-Ice North 4 SUV 107T TL" → "Michelin"
 _N1_NAME_RE = re.compile(r'\d+\s+R\s+\d{3}/\d{2,3}\s+(\S+)', re.IGNORECASE)
 
+# N1 flotation names: "{rim} R {diameter}x{section} {Manufacturer} {rest}"
+# E.g. "17 R 37x13.50 BFGoodrich Mud Terrain T/A KM3 121Q TL" → "BFGoodrich"
+_N1_FLOTATION_MFR_RE = re.compile(r'\d+\s+R\s+\d{2}x\d{1,2}(?:[.,]\d+)?\s+(\S+)', re.IGNORECASE)
+
 def extract_manufacturer_from_n1_name(name):
     if not name:
         return None
-    m = _N1_NAME_RE.search(name)
+    m = _N1_NAME_RE.search(name) or _N1_FLOTATION_MFR_RE.search(name)
     return m.group(1) if m else None
 
 
@@ -162,8 +166,11 @@ def is_jeep_tire(item):
     # Fast path: already classified during tire-dict construction
     if item.get("size_type") == "flotation":
         return True
-    # All sellers: flotation size string present in the product name
+    # All sellers: standard flotation size string present in the product name.
     if _FLOTATION_NAME_RE.search(item.get("product_name") or ""):
+        return True
+    # N1 stores flotation names reversed: "17 R 37x13.50 Brand...".
+    if _N1_FLOTATION_NAME_RE.search(item.get("product_name") or ""):
         return True
     # Mitra stores flotation tires as: width = section-width in inches (8–16),
     # aspect_ratio = outer diameter in inches (28–50)
@@ -260,8 +267,9 @@ _BLOCKED_MANUFACTURERS = {
     "Albourgh",
     "Trailermaxx",
     "Caliber",
-    "Delcora",
+    "Delcora"
 }
+_BLOCKED_MANUFACTURERS_LOWER = {m.lower() for m in _BLOCKED_MANUFACTURERS}
 
 
 _NON_TIRE_KEYWORDS = [
@@ -301,7 +309,7 @@ def is_valid_tire(item):
         return False
 
     mfr = (item.get("manufacturer") or "").lower()
-    if mfr in _BLOCKED_MANUFACTURERS:
+    if mfr in _BLOCKED_MANUFACTURERS_LOWER:
         return False
 
     # Klettur stores the truck-tire category as season="Vörubíladekk" in their API.
@@ -351,7 +359,7 @@ def drop_reason(item):
             return f"keyword: {k}"
 
     mfr = (item.get("manufacturer") or "").lower()
-    if mfr in _BLOCKED_MANUFACTURERS:
+    if mfr in _BLOCKED_MANUFACTURERS_LOWER:
         return f"blocked manufacturer: {item.get('manufacturer')}"
 
     if "vörubíladekk" in (item.get("season") or "").lower():
@@ -413,6 +421,7 @@ def main():
 
         for item in data:
             inventory = None  # default
+            source_size_type = item.get("size_type")
 
             # ── KLETTUR ──────────────────────────────────────────────────
             if seller == 'Klettur':
@@ -477,21 +486,34 @@ def main():
             # No sku, no inventory (spider pre-filters to in-stock only)
             elif seller == 'N1':
                 # N1's broad category includes motorcycle/bicycle sub-categories.
-                # Slugs are unaccented ASCII so "motordekk", "reidhjol" etc. are safe to check.
+                # Slugs/category text are normalized enough for these checks.
                 cat_slug = item.get('category_slug', '')
                 if any(frag in cat_slug for frag in ('motor', 'reidhjol', 'fjorhjol', 'atv')):
                     continue
-                width, aspect, rim = parse_size(item.get('size'))
+
                 product_name = item.get('name')
+                width, aspect, rim = parse_size(item.get('size'))
+
                 if width is None:
+                    # N1 Algolia spider emits canonical flotation size too: "37x13.50R17".
+                    fm_flt = _FLOTATION_PARSE_RE.search(str(item.get('size') or ''))
+                    if fm_flt:
+                        frac   = fm_flt.group(3)
+                        aspect = int(fm_flt.group(1))
+                        width  = round(int(fm_flt.group(2)) + (int(frac) / (10 ** len(frac)) if frac else 0), 2)
+                        rim    = int(fm_flt.group(4))
+
+                if width is None:
+                    # N1 product name uses rim-first flotation: "17 R 37x13.50 Brand...".
                     fm_flt = _N1_FLOTATION_NAME_RE.search(product_name or '')
                     if fm_flt:
                         frac   = fm_flt.group(4)
                         rim    = int(fm_flt.group(1))
                         aspect = int(fm_flt.group(2))
                         width  = round(int(fm_flt.group(3)) + (int(frac) / (10 ** len(frac)) if frac else 0), 2)
+
                 manufacturer = item.get('manufacturer') or extract_manufacturer_from_n1_name(product_name)
-                sku          = None
+                sku          = item.get('sku')
                 season       = normalize_season(item.get('season', ''))
                 price        = normalize_price(item.get('price'))
                 stock        = item.get('stock', 'in stock')
@@ -514,6 +536,7 @@ def main():
                 "inventory_count": safe_int(inventory) if inventory is not None else None,
                 "picture":         picture,
                 "source":          item.get('source', seller.lower() + '.is'),
+                "size_type":       source_size_type,
             }
 
             # Flotation/off-road tires: tag, override season, and map to standard fields.

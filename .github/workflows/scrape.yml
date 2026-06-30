@@ -33,6 +33,7 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -49,41 +50,57 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run tire spiders in parallel
+      - name: Verify Python files compile
+        run: |
+          set -e
+          python -m py_compile merge_tires.py
+          find Leita -name '*.py' -print0 | xargs -0 python -m py_compile
+
+      - name: Run core tire spiders in parallel
         run: |
           set -e
 
-          scrapy crawl klettur -O klettur.json \
+          run_spider() {
+            NAME="$1"
+            OUT="$2"
+            LOG="$3"
+            shift 3
+
+            echo "Starting $NAME..."
+            timeout 15m scrapy crawl "$NAME" -O "$OUT" \
+              -s DOWNLOAD_TIMEOUT=30 \
+              -s CLOSESPIDER_TIMEOUT=840 \
+              "$@" > "$LOG" 2>&1
+          }
+
+          run_spider klettur klettur.json klettur.log \
             -s CONCURRENT_REQUESTS=8 \
             -s CONCURRENT_REQUESTS_PER_DOMAIN=4 \
             -s DOWNLOAD_DELAY=0.1 \
             -s AUTOTHROTTLE_ENABLED=True \
             -s AUTOTHROTTLE_START_DELAY=0.2 \
             -s AUTOTHROTTLE_MAX_DELAY=4 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 \
-            > klettur.log 2>&1 &
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 &
           PID_KLETTUR=$!
 
-          scrapy crawl mitra -O mitra.json \
+          run_spider mitra mitra.json mitra.log \
             -s CONCURRENT_REQUESTS=8 \
             -s CONCURRENT_REQUESTS_PER_DOMAIN=4 \
             -s DOWNLOAD_DELAY=0.1 \
             -s AUTOTHROTTLE_ENABLED=True \
             -s AUTOTHROTTLE_START_DELAY=0.2 \
             -s AUTOTHROTTLE_MAX_DELAY=4 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 \
-            > mitra.log 2>&1 &
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 &
           PID_MITRA=$!
 
-          scrapy crawl nesdekk -O nesdekk.json \
+          run_spider nesdekk nesdekk.json nesdekk.log \
             -s CONCURRENT_REQUESTS=4 \
             -s CONCURRENT_REQUESTS_PER_DOMAIN=2 \
             -s DOWNLOAD_DELAY=0.25 \
             -s AUTOTHROTTLE_ENABLED=True \
             -s AUTOTHROTTLE_START_DELAY=0.5 \
             -s AUTOTHROTTLE_MAX_DELAY=6 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.5 \
-            > nesdekk.log 2>&1 &
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.5 &
           PID_NESDEKK=$!
 
           FAIL=0
@@ -93,16 +110,16 @@ jobs:
           wait $PID_NESDEKK || FAIL=1
 
           echo "===== Klettur log tail ====="
-          tail -n 80 klettur.log || true
+          tail -n 120 klettur.log || true
 
           echo "===== Mitra log tail ====="
-          tail -n 80 mitra.log || true
+          tail -n 120 mitra.log || true
 
           echo "===== Nesdekk log tail ====="
-          tail -n 80 nesdekk.log || true
+          tail -n 120 nesdekk.log || true
 
           if [ "$FAIL" -ne 0 ]; then
-            echo "::error::At least one spider failed."
+            echo "::error::At least one core spider failed or timed out."
             exit 1
           fi
 
@@ -123,9 +140,51 @@ jobs:
                   raise SystemExit(f"{name} returned 0 rows")
           PY
 
-      - name: Create empty N1 file
+      - name: Run N1 Algolia spider optional
         run: |
-          echo "[]" > n1.json
+          set +e
+
+          timeout 12m scrapy crawl n1 -O n1.json \
+            -s CONCURRENT_REQUESTS=4 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=4 \
+            -s DOWNLOAD_DELAY=0.05 \
+            -s AUTOTHROTTLE_ENABLED=True \
+            -s AUTOTHROTTLE_START_DELAY=0.2 \
+            -s AUTOTHROTTLE_MAX_DELAY=2 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 \
+            > n1.log 2>&1
+          STATUS=$?
+
+          echo "===== N1 log tail ====="
+          tail -n 160 n1.log || true
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::warning::N1 spider failed or timed out. Continuing with empty n1.json."
+            echo "[]" > n1.json
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("n1.json")
+          if not path.exists():
+              print("N1 output missing; creating empty n1.json")
+              path.write_text("[]", encoding="utf-8")
+              raise SystemExit(0)
+
+          try:
+              data = json.loads(path.read_text(encoding="utf-8"))
+          except Exception as exc:
+              print(f"N1 output invalid JSON: {exc}; replacing with []")
+              path.write_text("[]", encoding="utf-8")
+              raise SystemExit(0)
+
+          print(f"N1 raw: {len(data)}")
+          if len(data) == 0:
+              print("::warning::N1 returned 0 rows. Continuing without N1.")
+          PY
 
       - name: Merge tire data
         run: |
@@ -145,16 +204,16 @@ jobs:
           counts = Counter(item.get("seller") for item in data)
 
           print("Merged total:", len(data))
-          for seller in ["Klettur", "Mitra", "Nesdekk"]:
+          for seller in ["Klettur", "Mitra", "Nesdekk", "N1"]:
               print(f"{seller}: {counts.get(seller, 0)}")
 
-          missing = [
+          missing_core = [
               seller for seller in ["Klettur", "Mitra", "Nesdekk"]
               if counts.get(seller, 0) == 0
           ]
 
-          if missing:
-              raise SystemExit(f"Refusing to publish. Missing seller data: {', '.join(missing)}")
+          if missing_core:
+              raise SystemExit(f"Refusing to publish. Missing core seller data: {', '.join(missing_core)}")
 
           if len(data) < 1000:
               raise SystemExit(f"Refusing to publish suspiciously small feed: {len(data)} rows")
