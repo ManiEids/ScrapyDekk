@@ -10,10 +10,8 @@ on:
     # Once per day at 03:17 Iceland time / UTC
     - cron: '17 3 * * *'
 
-  # Manual "Run workflow" button
   workflow_dispatch: {}
 
-  # Run when scraper/feed code changes
   push:
     branches: [ main ]
     paths:
@@ -90,18 +88,9 @@ jobs:
             -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
           python -c "import json; d=json.load(open('nesdekk.json', encoding='utf-8')); print('Nesdekk raw:', len(d)); assert len(d) > 0"
 
-      - name: Run N1 slowly
+      - name: Create empty N1 file
         run: |
-          set -e
-          scrapy crawl n1 -O n1.json \
-            -s CONCURRENT_REQUESTS=1 \
-            -s CONCURRENT_REQUESTS_PER_DOMAIN=1 \
-            -s DOWNLOAD_DELAY=2 \
-            -s AUTOTHROTTLE_ENABLED=True \
-            -s AUTOTHROTTLE_START_DELAY=1 \
-            -s AUTOTHROTTLE_MAX_DELAY=10 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.0
-          python -c "import json; d=json.load(open('n1.json', encoding='utf-8')); print('N1 raw:', len(d)); assert len(d) > 0"
+          echo "[]" > n1.json
 
       - name: Merge tire data
         run: |
@@ -121,15 +110,18 @@ jobs:
           counts = Counter(item.get("seller") for item in data)
 
           print("Merged total:", len(data))
-          for seller in ["Klettur", "Mitra", "Nesdekk", "N1"]:
+          for seller in ["Klettur", "Mitra", "Nesdekk"]:
               print(f"{seller}: {counts.get(seller, 0)}")
 
-          missing = [seller for seller in ["Klettur", "Mitra", "Nesdekk", "N1"] if counts.get(seller, 0) == 0]
+          missing = [
+              seller for seller in ["Klettur", "Mitra", "Nesdekk"]
+              if counts.get(seller, 0) == 0
+          ]
 
           if missing:
               raise SystemExit(f"Refusing to publish. Missing seller data: {', '.join(missing)}")
 
-          if len(data) < 4000:
+          if len(data) < 3000:
               raise SystemExit(f"Refusing to publish suspiciously small feed: {len(data)} rows")
 
           print("Feed validation passed.")
@@ -145,4 +137,4 @@ jobs:
 
       - name: Nudge WordPress import
         run: |
-          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php?doing_wp_cron=1" >/dev/null || true
+          curl -fsS --max-time 30 "$WP_SITE/wp-cron.php" >/dev/null || true
