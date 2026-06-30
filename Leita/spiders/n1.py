@@ -83,7 +83,7 @@ class N1FullCatalogueSpider(scrapy.Spider):
         super().__init__(*args, **kwargs)
         self.seen_skus = set()
 
-    def start_requests(self):
+    async def start(self):
         payload = json.dumps({"attributes": [], "categorySlug": self.CATEGORY_SLUG})
         yield scrapy.Request(
             url=self.API_URL,

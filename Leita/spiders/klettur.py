@@ -78,7 +78,7 @@ class KletturSpider(scrapy.Spider):
 
     # ── Requests ───────────────────────────────────────────────
 
-    def start_requests(self):
+    async  def start(self):
         yield scrapy.Request(
             url=f"{self.API_BASE}?page=1",
             callback=self.parse_first_page,
