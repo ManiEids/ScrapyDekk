@@ -1,0 +1,61 @@
+# Diagnostic only. Does not scrape, merge, publish, or touch WordPress.
+# Answers one question: what can a GitHub runner reach on nesdekk.is, and is
+# the 403 about the TLS fingerprint, the headers, or purely the runner IP?
+name: Nesdekk access probe
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install probe dependencies
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install "curl_cffi>=0.7"
+
+      - name: Runner egress IP
+        run: |
+          set -e
+          echo "Runner public IP / ASN:"
+          curl -s --max-time 20 https://ipinfo.io/json || true
+          echo ""
+
+      - name: curl baselines
+        run: |
+          set +e
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+          URL='https://nesdekk.is/dekkjaleit/?tyre-filter=1'
+
+          echo "curl default UA          : $(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$URL")"
+          echo "curl Chrome UA (h2)      : $(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -A "$UA" "$URL")"
+          echo "curl Chrome UA (http1.1) : $(curl -s -o /dev/null -w '%{http_code}' --max-time 25 --http1.1 -A "$UA" "$URL")"
+          echo ""
+          echo "Response headers for the blocked request:"
+          curl -sI --max-time 25 -A "$UA" "$URL" | grep -iE 'http/|cf-ray|cf-mitigated|server|cf-cache' || true
+          exit 0
+
+      - name: Probe clients and paths
+        run: |
+          set -e
+          python tools/nesdekk_probe.py
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nesdekk-probe-results
+          path: probe_results.json
+          if-no-files-found: warn
