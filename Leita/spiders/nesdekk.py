@@ -15,9 +15,20 @@ import scrapy
 # handshake got 200 on every page from the same IP with no proxy.
 #
 # So this spider swaps Scrapy's downloader for scrapy-impersonate, which
-# fetches through curl_cffi. Do not add DEFAULT_REQUEST_HEADERS here: the
-# impersonation supplies a browser-consistent header set in the right order,
-# and overriding it breaks the fingerprint it is trying to match.
+# fetches through curl_cffi.
+#
+# Scrapy's UserAgentMiddleware has to be switched off alongside it. It injects
+# "Scrapy/x.y.z (+https://scrapy.org)" into every request, and curl_cffi sends
+# that verbatim - producing a Chrome TLS handshake carrying a Scrapy
+# User-Agent. Cloudflare reads that contradiction as a bot and challenges it,
+# which is exactly what happened in run 33615453122: the impersonation was
+# active (responses carried the "impersonate" flag and Chrome's HTTP/2
+# fingerprint) yet every page still came back 403.
+#
+# With the middleware off, curl_cffi supplies the User-Agent belonging to the
+# profile it is imitating, so the headers and the handshake agree and stay in
+# agreement when curl_cffi updates its browser profiles. For the same reason,
+# do not set DEFAULT_REQUEST_HEADERS here.
 IMPERSONATE = "chrome"  # alias for curl_cffi's newest Chrome profile
 
 
@@ -42,6 +53,8 @@ class NesdekkSpider(scrapy.Spider):
         },
         "DOWNLOADER_MIDDLEWARES": {
             "Leita.spiders.nesdekk.ImpersonateMiddleware": 543,
+            # Let the impersonation own the User-Agent; see the note above.
+            "scrapy.downloadermiddlewares.useragent.UserAgentMiddleware": None,
         },
         "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
         # Cloudflare rate-limits before it blocks; back off instead of dying.
