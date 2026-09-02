@@ -1,1 +1,4 @@
 scrapy>=2.16,<2.17
+# Nesdekk only: routes that spider through curl_cffi so its TLS handshake
+# matches Chrome, which is what Cloudflare checks from datacenter IPs.
+scrapy-impersonate>=1.9,<2

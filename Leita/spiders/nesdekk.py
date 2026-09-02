@@ -7,29 +7,27 @@ import re
 import scrapy
 
 
-# nesdekk.is sits behind Cloudflare, which answers the default Scrapy
-# User-Agent with 403 from datacenter IPs (GitHub Actions runners). Present a
-# normal browser header set and keep cookies so the Cloudflare clearance
-# cookie is reused across the ~180 listing pages.
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "is-IS,is;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Sec-Ch-Ua": '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"macOS"',
-}
+# nesdekk.is is behind Cloudflare, which answers anything that is not a real
+# browser with 403 + "cf-mitigated: challenge" when the request comes from a
+# datacenter IP. Headers alone do not help: probed from a GitHub runner
+# (AS8075 Microsoft), python urllib sending a full Chrome header set was
+# blocked on every page, while curl_cffi reproducing Chrome's TLS/JA3
+# handshake got 200 on every page from the same IP with no proxy.
+#
+# So this spider swaps Scrapy's downloader for scrapy-impersonate, which
+# fetches through curl_cffi. Do not add DEFAULT_REQUEST_HEADERS here: the
+# impersonation supplies a browser-consistent header set in the right order,
+# and overriding it breaks the fingerprint it is trying to match.
+IMPERSONATE = "chrome"  # alias for curl_cffi's newest Chrome profile
+
+
+class ImpersonateMiddleware:
+    """Tag every request, robots.txt included, with the browser to imitate."""
+
+    # spider is positional in Scrapy 2.x and dropped in a future release.
+    def process_request(self, request, spider=None):
+        request.meta.setdefault("impersonate", IMPERSONATE)
+        return None
 
 
 class NesdekkSpider(scrapy.Spider):
@@ -38,10 +36,14 @@ class NesdekkSpider(scrapy.Spider):
     start_urls = ["https://nesdekk.is/dekkjaleit/?tyre-filter=1"]
 
     custom_settings = {
-        # Also used for the robots.txt fetch, so set it at settings level.
-        "USER_AGENT": BROWSER_HEADERS["User-Agent"],
-        "DEFAULT_REQUEST_HEADERS": BROWSER_HEADERS,
-        "COOKIES_ENABLED": True,
+        "DOWNLOAD_HANDLERS": {
+            "http": "scrapy_impersonate.ImpersonateDownloadHandler",
+            "https": "scrapy_impersonate.ImpersonateDownloadHandler",
+        },
+        "DOWNLOADER_MIDDLEWARES": {
+            "Leita.spiders.nesdekk.ImpersonateMiddleware": 543,
+        },
+        "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
         # Cloudflare rate-limits before it blocks; back off instead of dying.
         "RETRY_ENABLED": True,
         "RETRY_TIMES": 5,

@@ -52,6 +52,42 @@ jobs:
           set -e
           python tools/nesdekk_probe.py
 
+      - name: Run the real Nesdekk spider end to end
+        run: |
+          set +e
+          pip install -r requirements.txt
+          timeout 15m scrapy crawl nesdekk -O nesdekk.json \
+            -s DOWNLOAD_TIMEOUT=60 \
+            -s CONCURRENT_REQUESTS=4 \
+            -s CONCURRENT_REQUESTS_PER_DOMAIN=2 \
+            -s DOWNLOAD_DELAY=0.25 \
+            -s AUTOTHROTTLE_ENABLED=True \
+            -s AUTOTHROTTLE_START_DELAY=0.5 \
+            -s AUTOTHROTTLE_MAX_DELAY=6 \
+            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.5 > nesdekk.log 2>&1
+          echo "spider exit: $?"
+
+          echo "===== status codes and totals ====="
+          grep -E "response_status_count|item_scraped_count|elapsed_time_seconds|retry/" nesdekk.log || true
+
+          echo "===== any blocks? ====="
+          grep -cE "403 Forbidden" nesdekk.log || true
+
+          python - <<'PY2'
+          import json
+          from pathlib import Path
+
+          p = Path("nesdekk.json")
+          rows = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+          print(f"NESDEKK ROWS: {len(rows)}")
+          if rows:
+              print("sample:", json.dumps(rows[0], ensure_ascii=False)[:220])
+              missing_price = sum(1 for r in rows if not r.get("price"))
+              missing_sku = sum(1 for r in rows if not r.get("sku"))
+              print(f"rows missing price: {missing_price} | missing sku: {missing_sku}")
+          PY2
+          exit 0
+
       - name: Upload probe results
         if: always()
         uses: actions/upload-artifact@v4
