@@ -57,6 +57,34 @@ Each entry in `combined_tire_data.json`:
 }
 ```
 
+## Repository secrets
+
+| Secret | Required | Purpose |
+| --- | --- | --- |
+| `DTS_SYNC_SECRET` | yes | Authenticates the WordPress feed-import call. |
+| `NESDEKK_PROXY` | yes in practice | Residential proxy URL for the Nesdekk spider only. |
+
+`nesdekk.is` is behind Cloudflare and returns `403` to the GitHub runner's
+datacenter IP no matter what headers are sent — verified over six retries with a
+full Chrome header set, while the same request from a residential IP returns
+`200`. Only the source IP matters, so the spider is routed through a residential
+proxy. Klettur, Mitra and N1 go direct.
+
+Set the secret to a full proxy URL:
+
+```
+http://USER:PASS@HOST:PORT
+```
+
+Use a **sticky session** endpoint if the provider offers one, so all ~180
+listing pages come from a single IP and Cloudflare's clearance cookie stays
+valid for the whole crawl. The crawl moves about 4.6 MB per day (0.14 GB a
+month), so the smallest pay-as-you-go bucket lasts a long time.
+
+If `NESDEKK_PROXY` is unset or the proxy fails, the run does not break: Nesdekk
+scrapes 0 rows, `carry_over.py` reuses its rows from the last published feed,
+and the run only fails once that data passes `MAX_STALE_DAYS` (3 days).
+
 ## Project structure
 
 ```

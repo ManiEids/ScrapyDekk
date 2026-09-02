@@ -61,6 +61,11 @@ jobs:
           find Leita -name '*.py' -print0 | xargs -0 python -m py_compile
 
       - name: Run core tire spiders in parallel
+        env:
+          # Residential proxy used only for nesdekk.is, which returns 403 to
+          # the runner's datacenter IP. Unset is tolerated: Nesdekk then
+          # scrapes 0 rows and carry_over.py reuses the previous feed.
+          NESDEKK_PROXY: ${{ secrets.NESDEKK_PROXY }}
         run: |
           set -e
 
@@ -97,14 +102,30 @@ jobs:
             -s AUTOTHROTTLE_TARGET_CONCURRENCY=2.0 &
           PID_MITRA=$!
 
-          run_spider nesdekk nesdekk.json nesdekk.log \
-            -s CONCURRENT_REQUESTS=4 \
-            -s CONCURRENT_REQUESTS_PER_DOMAIN=2 \
-            -s DOWNLOAD_DELAY=0.25 \
-            -s AUTOTHROTTLE_ENABLED=True \
-            -s AUTOTHROTTLE_START_DELAY=0.5 \
-            -s AUTOTHROTTLE_MAX_DELAY=6 \
-            -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.5 &
+          # Only nesdekk.is needs the proxy, so scope the env vars to this
+          # subshell rather than exporting them to Klettur and Mitra as well.
+          # Scrapy's HttpProxyMiddleware picks http_proxy/https_proxy up on its
+          # own; use a sticky-session endpoint so all ~180 listing pages come
+          # from one IP and Cloudflare's clearance cookie stays valid.
+          if [ -n "$NESDEKK_PROXY" ]; then
+            echo "Nesdekk: routing through the configured residential proxy."
+          else
+            echo "::warning::NESDEKK_PROXY is not set. nesdekk.is returns 403 to datacenter IPs, so Nesdekk will scrape 0 rows and fall back to carried-over data."
+          fi
+
+          (
+            export http_proxy="$NESDEKK_PROXY"
+            export https_proxy="$NESDEKK_PROXY"
+            run_spider nesdekk nesdekk.json nesdekk.log \
+              -s DOWNLOAD_TIMEOUT=60 \
+              -s CONCURRENT_REQUESTS=4 \
+              -s CONCURRENT_REQUESTS_PER_DOMAIN=2 \
+              -s DOWNLOAD_DELAY=0.25 \
+              -s AUTOTHROTTLE_ENABLED=True \
+              -s AUTOTHROTTLE_START_DELAY=0.5 \
+              -s AUTOTHROTTLE_MAX_DELAY=6 \
+              -s AUTOTHROTTLE_TARGET_CONCURRENCY=1.5
+          ) &
           PID_NESDEKK=$!
 
           FAIL=0
