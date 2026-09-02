@@ -7,10 +7,46 @@ import re
 import scrapy
 
 
+# nesdekk.is sits behind Cloudflare, which answers the default Scrapy
+# User-Agent with 403 from datacenter IPs (GitHub Actions runners). Present a
+# normal browser header set and keep cookies so the Cloudflare clearance
+# cookie is reused across the ~180 listing pages.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "is-IS,is;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-Ch-Ua": '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+}
+
+
 class NesdekkSpider(scrapy.Spider):
     name = "nesdekk"
     allowed_domains = ["nesdekk.is"]
     start_urls = ["https://nesdekk.is/dekkjaleit/?tyre-filter=1"]
+
+    custom_settings = {
+        # Also used for the robots.txt fetch, so set it at settings level.
+        "USER_AGENT": BROWSER_HEADERS["User-Agent"],
+        "DEFAULT_REQUEST_HEADERS": BROWSER_HEADERS,
+        "COOKIES_ENABLED": True,
+        # Cloudflare rate-limits before it blocks; back off instead of dying.
+        "RETRY_ENABLED": True,
+        "RETRY_TIMES": 5,
+        "RETRY_HTTP_CODES": [403, 429, 500, 502, 503, 504, 522, 524, 408],
+    }
 
     SEASON_MAP = {
         "sumardekk":      "Sumardekk",

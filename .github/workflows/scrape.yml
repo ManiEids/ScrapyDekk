@@ -17,6 +17,7 @@ on:
     paths:
       - 'Leita/**'
       - 'merge_tires.py'
+      - 'carry_over.py'
       - 'requirements.txt'
       - '.github/workflows/scrape.yml'
 
@@ -29,6 +30,9 @@ concurrency:
 
 env:
   WP_SITE: https://dekkjahusid.is
+  # A blocked seller's rows are reused from the last published feed for
+  # this many days before the run starts failing instead.
+  MAX_STALE_DAYS: '3'
 
 jobs:
   scrape:
@@ -53,7 +57,7 @@ jobs:
       - name: Verify Python files compile
         run: |
           set -e
-          python -m py_compile merge_tires.py
+          python -m py_compile merge_tires.py carry_over.py
           find Leita -name '*.py' -print0 | xargs -0 python -m py_compile
 
       - name: Run core tire spiders in parallel
@@ -119,12 +123,12 @@ jobs:
           tail -n 120 nesdekk.log || true
 
           if [ "$FAIL" -ne 0 ]; then
-            echo "::error::At least one core spider failed or timed out."
-            exit 1
+            echo "::warning::At least one core spider exited non-zero or timed out. See the log tails above."
           fi
 
           python - <<'PY'
           import json
+          from pathlib import Path
 
           files = {
               "Klettur": "klettur.json",
@@ -132,12 +136,26 @@ jobs:
               "Nesdekk": "nesdekk.json",
           }
 
+          counts = {}
           for name, path in files.items():
-              with open(path, encoding="utf-8") as f:
-                  data = json.load(f)
+              target = Path(path)
+              try:
+                  data = json.loads(target.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError) as exc:
+                  print(f"::warning::{name} produced no readable output ({exc})")
+                  target.write_text("[]", encoding="utf-8")
+                  data = []
+              counts[name] = len(data)
               print(f"{name} raw: {len(data)}")
-              if len(data) == 0:
-                  raise SystemExit(f"{name} returned 0 rows")
+
+          empty = [name for name, count in counts.items() if count == 0]
+          if len(empty) == len(files):
+              raise SystemExit("Every core spider returned 0 rows - aborting before merge.")
+          for name in empty:
+              print(
+                  f"::warning::{name} returned 0 rows; its previous data will be "
+                  "carried over if it is recent enough."
+              )
           PY
 
       - name: Run N1 Algolia spider optional
@@ -186,10 +204,36 @@ jobs:
               print("::warning::N1 returned 0 rows. Check the N1 log tail above.")
           PY
 
+      - name: Fetch previously published feed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if gh release download tire-feed \
+               --repo "$GITHUB_REPOSITORY" \
+               --pattern combined_tire_data.json \
+               --output previous_feed.json; then
+            python - <<'PY'
+          import json
+          from pathlib import Path
+
+          rows = json.loads(Path("previous_feed.json").read_text(encoding="utf-8"))
+          print(f"Previous feed: {len(rows)} rows")
+          PY
+          else
+            echo "::warning::No previous tire-feed asset to download; carry-over is unavailable this run."
+            rm -f previous_feed.json
+          fi
+
       - name: Merge tire data
         run: |
           set -e
           python merge_tires.py
+
+      - name: Carry over previous data for blocked sellers
+        run: |
+          set -e
+          python carry_over.py
 
       - name: Validate merged feed
         run: |
@@ -202,10 +246,15 @@ jobs:
               data = json.load(f)
 
           counts = Counter(item.get("seller") for item in data)
+          stale = Counter(
+              item.get("seller") for item in data if item.get("stale")
+          )
 
           print("Merged total:", len(data))
           for seller in ["Klettur", "Mitra", "Nesdekk", "N1"]:
-              print(f"{seller}: {counts.get(seller, 0)}")
+              carried = stale.get(seller, 0)
+              note = f"  ({carried} carried over from a previous run)" if carried else ""
+              print(f"{seller}: {counts.get(seller, 0)}{note}")
 
           missing_core = [
               seller for seller in ["Klettur", "Mitra", "Nesdekk"]
@@ -213,7 +262,12 @@ jobs:
           ]
 
           if missing_core:
-              raise SystemExit(f"Refusing to publish. Missing core seller data: {', '.join(missing_core)}")
+              raise SystemExit(
+                  "Refusing to publish. Missing core seller data: "
+                  f"{', '.join(missing_core)}. Either that spider has been failing "
+                  "for longer than MAX_STALE_DAYS or there was no previous feed to "
+                  "carry over from."
+              )
 
           if len(data) < 1000:
               raise SystemExit(f"Refusing to publish suspiciously small feed: {len(data)} rows")
