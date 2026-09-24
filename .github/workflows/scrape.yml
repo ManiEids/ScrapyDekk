@@ -284,22 +284,36 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Trigger WordPress feed import
+        # The WordPress host's DNS intermittently fails to resolve github.com /
+        # release-assets.githubusercontent.com (cURL error 6) and has thrown
+        # transient PHP fatals. Retry 5xx/network errors; fail fast on 4xx.
         run: |
-          set -e
+          HTTP_CODE=000
+          for WAIT in 0 120 300 600; do
+            if [ "$WAIT" -gt 0 ]; then
+              echo "Retrying WordPress sync in ${WAIT}s..."
+              sleep "$WAIT"
+            fi
 
-          HTTP_CODE=$(curl -sS --max-time 120 \
-            -X POST \
-            -H "X-DTS-Sync-Secret: ${{ secrets.DTS_SYNC_SECRET }}" \
-            -o dts-sync-response.json \
-            -w "%{http_code}" \
-            "$WP_SITE/wp-json/dts/v1/sync")
+            HTTP_CODE=$(curl -sS --max-time 120 \
+              -X POST \
+              -H "X-DTS-Sync-Secret: ${{ secrets.DTS_SYNC_SECRET }}" \
+              -o dts-sync-response.json \
+              -w "%{http_code}" \
+              "$WP_SITE/wp-json/dts/v1/sync") || HTTP_CODE=000
 
-          echo "WordPress sync HTTP status: $HTTP_CODE"
-          echo "WordPress sync response:"
-          cat dts-sync-response.json
-          echo ""
+            echo "WordPress sync HTTP status: $HTTP_CODE"
+            echo "WordPress sync response:"
+            head -c 2000 dts-sync-response.json 2>/dev/null || true
+            echo ""
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::error::WordPress sync failed with HTTP $HTTP_CODE"
-            exit 1
-          fi
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              exit 0
+            fi
+            if [ "$HTTP_CODE" -ge 400 ] && [ "$HTTP_CODE" -lt 500 ]; then
+              break
+            fi
+          done
+
+          echo "::error::WordPress sync failed with HTTP $HTTP_CODE"
+          exit 1
