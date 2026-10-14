@@ -1,0 +1,19 @@
+# The home runner builds the feed. If it stops (box off, IP blocked, token expired)
+# this fails, and GitHub emails the repo owner. No LLM, no secrets.
+name: Feed watchdog
+on:
+  schedule:
+    - cron: '30 12 * * *'
+  workflow_dispatch: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPDATED=$(gh release view tire-feed --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[]|select(.name=="combined_tire_data.json")|.updatedAt')
+          AGE_H=$(( ( $(date +%s) - $(date -d "$UPDATED" +%s) ) / 3600 ))
+          echo "tire-feed asset updated $UPDATED (${AGE_H}h ago)"
+          [ "$AGE_H" -le 36 ] || { echo "::error::Feed is ${AGE_H}h old; the home runner has not published"; exit 1; }
