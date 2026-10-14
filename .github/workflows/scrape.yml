@@ -6,20 +6,9 @@
 name: Scrape tires & publish feed
 
 on:
-  schedule:
-    # Once per day at 03:17 Iceland time / UTC
-    - cron: '17 3 * * *'
-
+  # Scheduled runs moved to the home runner (home/run_feed.sh): nesdekk.is
+  # challenges GitHub's Azure IPs. Kept as a manual fallback only.
   workflow_dispatch: {}
-
-  push:
-    branches: [ main ]
-    paths:
-      - 'Leita/**'
-      - 'merge_tires.py'
-      - 'carry_over.py'
-      - 'requirements.txt'
-      - '.github/workflows/scrape.yml'
 
 permissions:
   contents: write
